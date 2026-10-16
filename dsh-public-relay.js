@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * dsh-relay.js — DSH Web 中转脚本 + dsh web 守护进程（配合樱花映射 TCP 内网穿透）
+ * dsh-public-relay.js — DSH Web 中转脚本 + dsh web 守护进程（配合樱花映射 TCP 内网穿透）
  *
  * 用法：
- *   node dsh-relay.js [--port <port>] [--no-watchdog] [--no-force-loopback] [--help]
+ *   node dsh-public-relay.js [--port <port>] [--no-watchdog] [--no-force-loopback] [--help]
  *
  * 功能：
  *   1. 启动 dsh web 子进程并守护（崩溃自动重启，日志写入 dsh-web.log）
@@ -30,10 +30,10 @@ const DEFAULTS = {
 };
 
 const HELP = `
-dsh-relay — DSH Web 中转脚本（樱花映射 TCP 内网穿透）
+dsh-public-relay — DSH Web 中转脚本（樱花映射 TCP 内网穿透）
 
 用法:
-  node dsh-relay.js [选项]
+  node dsh-public-relay.js [选项]
 
 功能:
   1. 启动 dsh web 子进程并守护（崩溃自动重启，日志写入 dsh-web.log）
@@ -49,14 +49,14 @@ dsh-relay — DSH Web 中转脚本（樱花映射 TCP 内网穿透）
   --help               显示本帮助
 
 示例:
-  node dsh-relay.js                        # 一键启动（守护 dsh web + 中转）
-  node dsh-relay.js --port 9000            # 换个中转端口
-  node dsh-relay.js --no-watchdog          # 只跑中转，不启动 dsh web
-  node dsh-relay.js --password '其他口令'   # 换个口令
+  node dsh-public-relay.js                        # 一键启动（守护 dsh web + 中转）
+  node dsh-public-relay.js --port 9000            # 换个中转端口
+  node dsh-public-relay.js --no-watchdog          # 只跑中转，不启动 dsh web
+  node dsh-public-relay.js --password '其他口令'   # 换个口令
 `;
 
 function fail(msg) {
-  console.error(`dsh-relay: ${msg}`);
+  console.error(`dsh-public-relay: ${msg}`);
   console.error(HELP);
   process.exit(1);
 }
@@ -171,7 +171,7 @@ function serializeHeaders(headers) {
 // ─────────────────────────── 可选口令认证 ───────────────────────────
 
 function makeAuth(password) {
-  const secret = crypto.createHmac('sha256', 'dsh-relay').update(password).digest();
+  const secret = crypto.createHmac('sha256', 'dsh-public-relay').update(password).digest();
   const cookieName = 'relay_session';
   const COOKIE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
 
@@ -222,7 +222,7 @@ function makeAuth(password) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dsh-relay 登录</title>
+<title>dsh-public-relay 登录</title>
 <style>
   body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#0f1115;color:#e6e6e6;
        display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
@@ -238,7 +238,7 @@ function makeAuth(password) {
 </head>
 <body>
   <form class="card" method="post" action="/__login">
-    <h1>dsh-relay 访问口令</h1>
+    <h1>dsh-public-relay 访问口令</h1>
     <p>请输入启动时设置的口令以继续</p>
     <input type="password" name="password" placeholder="口令" autocomplete="off" autofocus required>
     <button type="submit">进入</button>
@@ -458,7 +458,7 @@ process.on('unhandledRejection', (reason) => {
 process.on('exit', (code) => {
   // exit 事件里只能同步操作，直接写文件
   try { fs.appendFileSync(WATCHDOG_LOG_FILE, `[${new Date().toISOString()}] relay 进程退出，exit code=${code}\n`); } catch {}
-  console.log(`dsh-relay: 进程退出 (code=${code})`);
+  console.log(`dsh-public-relay: 进程退出 (code=${code})`);
 });
 
 // ── 心跳定时器：确保事件循环永远不为空 ──
@@ -525,9 +525,9 @@ function authGate(req, res, socket) {
   }
   if (res) {
     res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-    res.end('dsh-relay: 未登录（需要访问口令）。\n');
+    res.end('dsh-public-relay: 未登录（需要访问口令）。\n');
   } else if (socket) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\ndsh-relay: 未登录（需要访问口令）');
+    socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\ndsh-public-relay: 未登录（需要访问口令）');
     socket.destroy();
   }
   return false;
@@ -726,7 +726,7 @@ server.on('clientError', (err, socket) => {
 
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
-    console.error(`dsh-relay: 端口 ${config.port} 已被占用，换一个端口（--port）再试。`);
+    console.error(`dsh-public-relay: 端口 ${config.port} 已被占用，换一个端口（--port）再试。`);
     process.exit(1);
   }
   throw err;
@@ -744,16 +744,16 @@ server.listen(config.port, config.host, () => {
   const addr = server.address();
   const port = typeof addr === 'object' && addr ? addr.port : config.port;
   console.log('────────────────────────────────────────────────────────────');
-  console.log(`dsh-relay: 中转监听 ${config.host}:${port}，转发到 ${TARGET.origin}`);
-  console.log(`dsh-relay: 樱花映射 TCP 隧道的「本地端口」请填 ${port}`);
+  console.log(`dsh-public-relay: 中转监听 ${config.host}:${port}，转发到 ${TARGET.origin}`);
+  console.log(`dsh-public-relay: 樱花映射 TCP 隧道的「本地端口」请填 ${port}`);
   if (config.watchdog) {
-    console.log(`dsh-relay: dsh web 守护已启动（崩溃自动重启，日志：dsh-web.log）`);
+    console.log(`dsh-public-relay: dsh web 守护已启动（崩溃自动重启，日志：dsh-web.log）`);
   }
   if (AUTH) {
-    console.log(`dsh-relay: 访问口令: ${config.password}`);
+    console.log(`dsh-public-relay: 访问口令: ${config.password}`);
   }
   if (config.forceLoopback) {
-    console.log('dsh-relay: 已启用 force-loopback（公网可看插件列表，Ctrl+F5 硬刷新生效）');
+    console.log('dsh-public-relay: 已启用 force-loopback（公网可看插件列表，Ctrl+F5 硬刷新生效）');
   }
   console.log('────────────────────────────────────────────────────────────');
 });

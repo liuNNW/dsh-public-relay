@@ -16,9 +16,9 @@
  */
 import http from 'node:http';
 import net from 'node:net';
-import { createRelay } from '../dsh-relay/lib/relay.js';
-import { createSessionSigner } from '../dsh-relay/lib/dsh-cookie.js';
-import { normalizeConfig } from '../dsh-relay/lib/config.js';
+import { createRelay } from '../dsh-public-relay/lib/relay.js';
+import { createSessionSigner } from '../dsh-public-relay/lib/dsh-cookie.js';
+import { normalizeConfig } from '../dsh-public-relay/lib/config.js';
 
 const dshPort = Number(process.argv[2] ?? 19387);
 const PASSWORD = 'e2e-test-password';
@@ -113,7 +113,7 @@ async function main() {
   section('第 1 步：未登录时被中转拦下');
   const anon = await req(relayPort, '/');
   check('未带口令 → 看到中转登录页（而非 dsh 的 401）',
-    anon.status === 200 && anon.body.includes('dsh-relay 访问口令'),
+    anon.status === 200 && anon.body.includes('dsh-public-relay 访问口令'),
     `status=${anon.status} body=${anon.body.slice(0, 60)}`);
 
   section('第 2 步：用中转口令登录');

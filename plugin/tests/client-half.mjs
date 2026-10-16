@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * client-half.mjs — dsh-relay 浏览器半测试
+ * client-half.mjs — dsh-public-relay 浏览器半测试
  *
  * client.js 是 dsh web 按 classic script 加载的 bundle：执行时只调
  * window.__ModuleLoader__.load({id, factory}) 注册工厂，真正的副作用
@@ -9,7 +9,7 @@
  *   1. 造一个假 window.__ModuleLoader__，跑 client.js 文本；
  *   2. 用假的 require('react') 物化 factory，拿到 exports；
  *   3. 调 apply(ctx)，验证 settings.section 与 shell.overlay 两个座位都注册了；
- *   4. 用假 React 真渲染两个组件，验证不抛错、且真的发出 /dsh-relay/status 请求；
+ *   4. 用假 React 真渲染两个组件，验证不抛错、且真的发出 /dsh-public-relay/status 请求；
  *   5. 验证宿主不可用时组件静默降级（不白屏）。
  *
  * 运行：node plugin/tests/client-half.mjs
@@ -228,7 +228,7 @@ function findByClass(root, needle) {
 
 // ─────────────────────────── 加载 client bundle ───────────────────────────
 
-const clientPath = path.resolve(import.meta.dirname, '..', 'dsh-relay', 'lib', 'client.js');
+const clientPath = path.resolve(import.meta.dirname, '..', 'dsh-public-relay', 'lib', 'client.js');
 const clientSource = fs.readFileSync(clientPath, 'utf8');
 
 function loadClientBundle() {
@@ -337,7 +337,7 @@ async function main() {
   section('bundle 注册（classic script 契约）');
   const env = loadClientBundle();
   check('只注册了一个 factory', env.registrations.length === 1, `got ${env.registrations.length}`);
-  check('注册 id = dsh-relay', env.registrations[0]?.id === 'dsh-relay', `got ${env.registrations[0]?.id}`);
+  check('注册 id = dsh-public-relay', env.registrations[0]?.id === 'dsh-public-relay', `got ${env.registrations[0]?.id}`);
   check('factory 是函数', typeof env.registrations[0]?.factory === 'function', 'factory is not a function');
   check('执行脚本时无副作用（未插样式）', env.styleTags.length === 0,
     `style injected at script time: ${env.styleTags.length} — 物化前不该有副作用`);
@@ -365,7 +365,7 @@ async function main() {
     `got ${env.styleTags.length}`);
 
   section('Cordis 插件形状');
-  check('name = dsh-relay', exports.name === 'dsh-relay', `got ${exports.name}`);
+  check('name = dsh-public-relay', exports.name === 'dsh-public-relay', `got ${exports.name}`);
   check('apply 是函数', typeof exports.apply === 'function', 'apply missing');
   check('inject 是数组', Array.isArray(exports.inject), `got ${typeof exports.inject}`);
   check('inject 含 slots', exports.inject.includes('slots'), `got ${JSON.stringify(exports.inject)}`);
@@ -403,7 +403,7 @@ async function main() {
   check('只有 slots 时 apply 也能完成（零服务依赖）', true);
 
   check('apply 后注入样式', env.styleTags.length === 1, `got ${env.styleTags.length}`);
-  check('样式标签带 data-plugin', env.styleTags[0]?.dataset?.plugin === 'dsh-relay', `got ${JSON.stringify(env.styleTags[0]?.dataset)}`);
+  check('样式标签带 data-plugin', env.styleTags[0]?.dataset?.plugin === 'dsh-public-relay', `got ${JSON.stringify(env.styleTags[0]?.dataset)}`);
   check('样式内容非空', typeof env.styleTags[0]?.textContent === 'string' && env.styleTags[0].textContent.length > 100,
     `len=${env.styleTags[0]?.textContent?.length}`);
 
@@ -425,10 +425,10 @@ async function main() {
   const itemReg = registers.find((r) => r.meta.name === 'plugins.item');
   const settingsReg = registers.find((r) => r.meta.name === 'settings.section');
   check('plugins.item 元数据正确',
-    itemReg?.meta.id === 'dshRelay' && typeof itemReg?.meta.order === 'number' && Boolean(itemReg?.meta.label),
+    itemReg?.meta.id === 'dshPublicRelay' && typeof itemReg?.meta.order === 'number' && Boolean(itemReg?.meta.label),
     JSON.stringify(itemReg?.meta));
   check('settings.section 元数据正确',
-    settingsReg?.meta.id === 'dshRelay' && typeof settingsReg?.meta.order === 'number' && Boolean(settingsReg?.meta.label),
+    settingsReg?.meta.id === 'dshPublicRelay' && typeof settingsReg?.meta.order === 'number' && Boolean(settingsReg?.meta.label),
     JSON.stringify(settingsReg?.meta));
 
   // ── 关键：座位的注入面必须为空 ──
@@ -675,8 +675,8 @@ async function main() {
     '样式里仍存在 position:fixed 规则');
 
   section('请求路径正确');
-  check('确实请求了 /dsh-relay/status',
-    env.fetchCalls.some((c) => String(c.url).endsWith('/dsh-relay/status')),
+  check('确实请求了 /dsh-public-relay/status',
+    env.fetchCalls.some((c) => String(c.url).endsWith('/dsh-public-relay/status')),
     env.fetchCalls.map((c) => c.url).join(', '));
 
   // ── 渲染：宿主不可用（降级，不白屏）──

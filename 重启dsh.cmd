@@ -4,7 +4,7 @@ setlocal EnableDelayedExpansion
 title 重启 dsh（加载 DSH 中转插件）
 
 echo ============================================================
-echo   重启 DeepSeek Harness 以加载 dsh-relay 插件
+echo   重启 DeepSeek Harness 以加载 dsh-public-relay 插件
 echo ============================================================
 echo.
 echo   为什么必须完全重启：

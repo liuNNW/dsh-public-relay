@@ -1,7 +1,7 @@
 /**
  * relay.js — DSH 中转核心（纯库，无进程副作用）
  *
- * 移植自工作区根的 dsh-relay.js，改动集中在四处「独立进程假设」：
+ * 移植自工作区根的 dsh-public-relay.js，改动集中在四处「独立进程假设」：
  *   1. 删除 process.exit() / fail() / 打印 HELP —— 改抛异常或记入 lastError；
  *   2. 删除整个 dsh web watchdog（startDshWeb/stopDshWeb/快速崩溃/心跳/SIGINT）——
  *      插件就跑在 dsh 进程内，没有子进程可守，宿主本身不会退出；
@@ -90,7 +90,7 @@ export function resolveTarget(host, port) {
 /** HMAC-SHA256 签名 Cookie 会话；空口令返回 null（关闭认证）。 */
 export function makeAuth(password) {
   if (!password) return null;
-  const secret = crypto.createHmac('sha256', 'dsh-relay').update(password).digest();
+  const secret = crypto.createHmac('sha256', 'dsh-public-relay').update(password).digest();
   const cookieName = 'relay_session';
   const COOKIE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
 
@@ -144,7 +144,7 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dsh-relay 登录</title>
+<title>dsh-public-relay 登录</title>
 <style>
   body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#0f1115;color:#e6e6e6;
        display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
@@ -160,7 +160,7 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 </head>
 <body>
   <form class="card" method="post" action="/__login">
-    <h1>dsh-relay 访问口令</h1>
+    <h1>dsh-public-relay 访问口令</h1>
     <p>请输入启动时设置的口令以继续</p>
     <input type="password" name="password" placeholder="口令" autocomplete="off" autofocus required>
     <button type="submit">进入</button>
@@ -267,9 +267,9 @@ function authGate(req, res, socket, auth, password, log) {
   }
   if (res) {
     res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-    res.end('dsh-relay: 未登录（需要访问口令）。\n');
+    res.end('dsh-public-relay: 未登录（需要访问口令）。\n');
   } else if (socket) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\ndsh-relay: 未登录（需要访问口令）');
+    socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\ndsh-public-relay: 未登录（需要访问口令）');
     socket.destroy();
   }
   return false;

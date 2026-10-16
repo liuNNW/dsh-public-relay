@@ -24,9 +24,9 @@ import path from 'node:path';
 import {
   createSessionSigner, parseSecretFromCredentials, cookieNameFor,
   encodeCookie, decodeCookie, decodeBase64Url, encodeBase64Url, readCookieValue,
-} from '../dsh-relay/lib/dsh-cookie.js';
-import { createRelay } from '../dsh-relay/lib/relay.js';
-import { normalizeConfig } from '../dsh-relay/lib/config.js';
+} from '../dsh-public-relay/lib/dsh-cookie.js';
+import { createRelay } from '../dsh-public-relay/lib/relay.js';
+import { normalizeConfig } from '../dsh-public-relay/lib/config.js';
 
 /* ── 测试骨架 ── */
 const WATCHDOG_MS = 120000;

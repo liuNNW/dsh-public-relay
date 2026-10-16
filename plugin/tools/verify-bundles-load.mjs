@@ -6,10 +6,10 @@
  * 并加 BOM。全部用 node 的 fs 完成。
  *
  * 它做的事：
- *   1. 建临时 DSH_HOME（web profile，bundles 里含 dsh-relay）
+ *   1. 建临时 DSH_HOME（web profile，bundles 里含 dsh-public-relay）
  *   2. 链共享 node_modules 供解析 dsh 自身模块
  *   3. 装插件到 profile 本地 node_modules
- *   4. 先跑 dump-config，确认组合树含 dsh-relay
+ *   4. 先跑 dump-config，确认组合树含 dsh-public-relay
  *   5. 再真实启动 dsh web，确认插件日志
  *   6. 清理
  *
@@ -20,7 +20,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 
-const PLUGIN_SRC = path.resolve(import.meta.dirname, '..', 'dsh-relay');
+const PLUGIN_SRC = path.resolve(import.meta.dirname, '..', 'dsh-public-relay');
 const REAL_SHARED = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'profiles', 'node_modules');
 const tmp = path.join(os.tmpdir(), `dsh-bundles-${Date.now()}`);
 const webDir = path.join(tmp, 'profiles', 'web');
@@ -42,14 +42,14 @@ async function main() {
   w(path.join(webDir, 'package.json'), `${JSON.stringify({
     name: 'dsh-profile-web',
     private: true,
-    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-relay'] } },
+    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-public-relay'] } },
   }, null, 2)}\n`);
   w(path.join(webDir, 'cordis.yml'), '[]\n');
   w(path.join(webDir, 'cordis.patch.yml'), '[]\n');
   w(path.join(tmp, '.credentials.yaml'), 'version: "1"\nrefs: {}\nrecords: {}\n');
 
   // 插件到 profile 本地
-  const dst = path.join(webDir, 'node_modules', 'dsh-relay');
+  const dst = path.join(webDir, 'node_modules', 'dsh-public-relay');
   fs.mkdirSync(path.join(dst, 'lib'), { recursive: true });
   for (const f of ['package.json', 'cordis.patch.yml']) fs.copyFileSync(path.join(PLUGIN_SRC, f), path.join(dst, f));
   for (const f of fs.readdirSync(path.join(PLUGIN_SRC, 'lib'))) {
@@ -65,16 +65,16 @@ async function main() {
   const env = { ...process.env, DSH_HOME: tmp };
 
   // dump-config
-  head('dump-config：组合树是否含 dsh-relay');
+  head('dump-config：组合树是否含 dsh-public-relay');
   const dump = spawnSync('dsh', ['--profile', 'web', '--dump-config'], { env, encoding: 'utf8', shell: true, timeout: 180000 });
   const stdout = dump.stdout || '';
   const stderr = dump.stderr || '';
   say(`  退出码 ${dump.status}`);
-  const hit = /dsh-relay/.test(stdout);
+  const hit = /dsh-public-relay/.test(stdout);
   if (hit) {
-    say('  ✓ 组合树含 dsh-relay');
+    say('  ✓ 组合树含 dsh-public-relay');
     const ls = stdout.split('\n');
-    const i = ls.findIndex((l) => /dsh-relay/.test(l));
+    const i = ls.findIndex((l) => /dsh-public-relay/.test(l));
     for (const l of ls.slice(Math.max(0, i - 2), i + 5)) say(`    ${l}`);
   } else {
     say('  ✗ 不含');
@@ -107,9 +107,9 @@ async function main() {
   const errText = fs.existsSync(errFile) ? fs.readFileSync(errFile, 'utf8') : '';
 
   head('插件日志');
-  const relayLogs = outText.split('\n').filter((l) => /dsh-relay/.test(l));
+  const relayLogs = outText.split('\n').filter((l) => /dsh-public-relay/.test(l));
   if (relayLogs.length) for (const l of relayLogs) say(`  ${l.trim()}`);
-  else say('  （无 dsh-relay 日志）');
+  else say('  （无 dsh-public-relay 日志）');
 
   const ports = spawnSync('powershell', ['-NoProfile', '-Command',
     "(Get-NetTCPConnection -State Listen -EA SilentlyContinue | Where-Object {$_.LocalPort -in 3080,3091} | Select-Object -ExpandProperty LocalPort) -join ','"],

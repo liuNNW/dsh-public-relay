@@ -1,5 +1,5 @@
 /**
- * client.js — dsh-relay 浏览器端（classic script）
+ * client.js — dsh-public-relay 浏览器端（classic script）
  *
  * ── 座位（都在设置里，不往页面挂任何悬浮元素）──
  *   1. settings.section → 设置左侧栏的「DSH 中转」整页（主入口）
@@ -8,7 +8,7 @@
  * ── 为什么零服务依赖 ──
  *
  * 本插件只 inject `slots`（没有座位就无处挂 UI），页面的读写全部走**自己的
- * HTTP 路由**（宿主半已注册 /dsh-relay/*）。不依赖 configForms / locale /
+ * HTTP 路由**（宿主半已注册 /dsh-public-relay/*）。不依赖 configForms / locale /
  * timer / ui-primitives 等宿主服务，理由是一个实测教训：
  *
  *   早先版本用 configForms 生成表单，但它并不在本宿主的客户端服务目录里
@@ -23,7 +23,7 @@
  * 面板或整个页面白屏。
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-relay',
+  id: 'dsh-public-relay',
   factory: (require) => {
     var module = { exports: {} };
     var exports = module.exports;
@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
     const { useState, useEffect, useRef } = react;
 
     /** 宿主 HTTP 路由前缀（相对页面 base 解析，Electron 的 dsh-app:// 也能命中）。 */
-    const API_PREFIX = 'dsh-relay';
+    const API_PREFIX = 'dsh-public-relay';
 
     /** 只硬依赖 slots：没有座位就无处挂 UI。其余一切自给自足。 */
     const inject = ['slots'];
@@ -137,7 +137,7 @@ window.__ModuleLoader__.load({
       '.dsr-actions{display:flex;align-items:center;gap:10px;padding-top:6px;flex-wrap:wrap}',
     ].join('\n');
 
-    const CSS_TAG_ID = 'dsh-relay/client.css';
+    const CSS_TAG_ID = 'dsh-public-relay/client.css';
 
     /**
      * 注入样式。**总是替换**旧标签而不是「已存在就跳过」：
@@ -152,7 +152,7 @@ window.__ModuleLoader__.load({
           try { existing.remove(); } catch (e) { /* 已移除 */ }
         }
         const tag = document.createElement('style');
-        tag.dataset.plugin = 'dsh-relay';
+        tag.dataset.plugin = 'dsh-public-relay';
         tag.dataset.pluginCss = CSS_TAG_ID;
         tag.textContent = CSS;
         document.head.appendChild(tag);
@@ -170,7 +170,7 @@ window.__ModuleLoader__.load({
     function removeLegacyBadge() {
       try {
         if (typeof document === 'undefined') return;
-        const sel = ['.dsr-badge', '#dsh-relay-badge'];
+        const sel = ['.dsr-badge', '#dsh-public-relay-badge'];
         for (let i = 0; i < sel.length; i++) {
           const nodes = document.querySelectorAll(sel[i]);
           for (let j = 0; j < nodes.length; j++) {
@@ -581,7 +581,7 @@ window.__ModuleLoader__.load({
        * 这是刻意设计 —— 一旦注入面里写了某个宿主不提供的服务名，该座位的
        * fiber 就永远停在不就绪状态，外壳不会挂载它，槽位账本里表现为
        * `active: false`，用户看到的就是「设置里根本没有这个插件」。
-       * 面板的数据全部走自有的 /dsh-relay/* 路由，不需要任何服务。
+       * 面板的数据全部走自有的 /dsh-public-relay/* 路由，不需要任何服务。
        */
       const panel = (mode) => (props) => h(RelayPanel, {
         view: props && props.view,
@@ -595,14 +595,14 @@ window.__ModuleLoader__.load({
         const Section = panel('section');
         ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section',
-          id: 'dshRelay',
+          id: 'dshPublicRelay',
           order: 40,
           label: t('title'),
           inject: () => ({}),
         }, Section));
         okCount++;
       } catch (e) {
-        console.error('[dsh-relay] settings.section 注册失败：', e);
+        console.error('[dsh-public-relay] settings.section 注册失败：', e);
       }
 
       // 座位 2：「设置 → 插件」里的配置卡片
@@ -610,22 +610,22 @@ window.__ModuleLoader__.load({
         const Card = panel('card');
         ctx.slots.inject('plugins.item', () => ctx.slots.register({
           name: 'plugins.item',
-          id: 'dshRelay',
+          id: 'dshPublicRelay',
           order: 60,
           label: t('title'),
           inject: () => ({}),
         }, Card));
         okCount++;
       } catch (e) {
-        console.error('[dsh-relay] plugins.item 注册失败：', e);
+        console.error('[dsh-public-relay] plugins.item 注册失败：', e);
       }
 
       try {
-        ctx.logger?.info?.('[dsh-relay] 浏览器端已挂载（注册了 ' + okCount + ' 个设置座位，零服务依赖）');
+        ctx.logger?.info?.('[dsh-public-relay] 浏览器端已挂载（注册了 ' + okCount + ' 个设置座位，零服务依赖）');
       } catch (e) { /* 日志失败忽略 */ }
     }
 
-    exports.name = 'dsh-relay';
+    exports.name = 'dsh-public-relay';
     exports.inject = inject;
     exports.apply = apply;
     return module.exports;

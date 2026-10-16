@@ -1,5 +1,5 @@
 /**
- * config.js — dsh-relay 配置契约（宿主与设置页共用一份常量）
+ * config.js — dsh-public-relay 配置契约（宿主与设置页共用一份常量）
  *
  * 这里声明的字段就是「设置 → 插件 → DSH 中转」页面能改的全部内容。
  *
@@ -10,7 +10,7 @@
  *   - 加载时 Loader 传给 apply 的 `.volatile()` 字段是引用对象（`{ get() }`），
  *     统一用 unwrap() 取值，让下游只面对普通对象。
  *
- * @module dsh-relay/config
+ * @module dsh-public-relay/config
  */
 import z from '@deepseek-ai/schemastery';
 
@@ -35,13 +35,13 @@ function vol(schema) {
 }
 
 /** Cordis 插件名：Loader 诊断与日志里可见。 */
-export const name = 'dsh-relay';
+export const name = 'dsh-public-relay';
 
 /**
  * 设置命名空间 / profile 条目 id。
  * 必须与 cordis.patch.yml 里的 `id` 完全一致，设置页才有可读写的表单。
  */
-export const SETTINGS_NAMESPACE = 'dsh-relay';
+export const SETTINGS_NAMESPACE = 'dsh-public-relay';
 
 /** credentials 记录键（历史兼容：早期版本把整份配置存在这里）。 */
 export const CRED_REF = 'DSH_RELAY_CONFIG';

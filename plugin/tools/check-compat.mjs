@@ -121,17 +121,31 @@ function satisfies(version, range) {
 //   插件管理器会拿它们跟运行时版本比对，rc 系列用 ^ 极易不匹配，
 //   一旦不匹配就 incompatible-version、rows 为空、UI 上彻底看不到插件。
 const peers = pkg.peerDependencies || {};
+const peersMeta = pkg.peerDependenciesMeta || {};
 const ALLOWED_PEER_PREFIX = '@deepseek-ai/cordis';
+
+/** 该 peer 是否被标成 optional。 */
+const isOptionalPeer = (name) => peersMeta[name]?.optional === true;
 
 for (const [name, range] of Object.entries(peers)) {
   const actual = installedVersion(name);
 
+  // `optional: true` 的 peer 是安全写法 —— 已发布并在市场里的
+  // @deepseek-ai/dsh-mimo-vision 与 dsh-plugin-wallpaper-engine 都用它把
+  // dsh 自带能力包声明进来。optional 的含义是「宿主没提供也不报错」，
+  // 插件管理器不会拿它做 incompatible-version 判定，因此不该判失败。
+  if (isOptionalPeer(name)) {
+    if (actual === null) notes.push(`${name}@${range}（optional；解析路径内未找到运行时版本，跳过比对）`);
+    else notes.push(`${name}@${range} ↔ 运行时 ${actual}（optional，不参与版本拒绝）`);
+    continue;
+  }
+
   if (!name.startsWith(ALLOWED_PEER_PREFIX)) {
     problems.push(
-      `peerDependencies 声明了 ${name}@${range}：dsh 自带能力包不应写进 peers。`
-      + `插件管理器会校验它与运行时版本，不匹配就整包拒绝`
+      `peerDependencies 声明了**非 optional** 的 ${name}@${range}：dsh 自带能力包必须标 optional，`
+      + `否则插件管理器会校验它与运行时版本，不匹配就整包拒绝`
       + `（症状：dsh 启动正常但 UI 里完全没有这个插件）。`
-      + `改为运行期 ctx.get('<服务名>') 软获取。`,
+      + `加进 peerDependenciesMeta 标 optional: true，或改为运行期 ctx.get('<服务名>') 软获取。`,
     );
     continue;
   }

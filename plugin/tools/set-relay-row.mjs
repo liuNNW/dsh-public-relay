@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * set-relay-row.mjs — 在 profile 的 cordis.patch.yml 里写入/更新 dsh-relay 条目
+ * set-relay-row.mjs — 在 profile 的 cordis.patch.yml 里写入/更新 dsh-public-relay 条目
  *
  * ── 为什么必须是 `- insert:` 包裹（关键，踩过坑）──
  *
@@ -9,13 +9,13 @@
  *   · 不带 `insert:` 的 → **修改已存在的条目**，按 id 去找；
  *                        找不到就 warn + continue，**静默丢弃**
  *
- * 所以写成裸 `- id: dsh-relay` 完全不会新增任何东西 —— 它被当成
- * 「找一条 id=dsh-relay 的已有条目来改」，而那条根本不存在。
+ * 所以写成裸 `- id: dsh-public-relay` 完全不会新增任何东西 —— 它被当成
+ * 「找一条 id=dsh-public-relay 的已有条目来改」，而那条根本不存在。
  * 正确写法与 @deepseek-ai/dsh-mimo-vision 一致：
  *
  *   - insert:
- *       - id: dsh-relay
- *         name: dsh-relay
+ *       - id: dsh-public-relay
+ *         name: dsh-public-relay
  *         config: { ... }
  *
  * ── 其它必须守住的约束（都踩过）──
@@ -49,7 +49,7 @@ if (!fs.existsSync(patchPath)) {
   process.exit(1);
 }
 
-const ROW_ID = 'dsh-relay';
+const ROW_ID = 'dsh-public-relay';
 const MARKER = `# --- ${ROW_ID} (DSH 中转插件) ---`;
 
 /** 条目文本。必须带 insert:，否则会被 dsh 静默丢弃。 */
@@ -112,7 +112,7 @@ function locateBlock() {
     return { start: markerAt, end: markerAt + 1 };
   }
 
-  // b) 无标记：找 `- insert:`，其下第一个缩进条目是 id=dsh-relay
+  // b) 无标记：找 `- insert:`，其下第一个缩进条目是 id=dsh-public-relay
   for (let i = 0; i < lines.length; i++) {
     if (!/^- insert:\s*$/.test(lines[i])) continue;
     let j = i + 1;
@@ -173,7 +173,7 @@ if (block) {
   fs.writeFileSync(patchPath, out, 'utf8');
 }
 
-// ── 回读校验：合法数组 + 存在 insert→dsh-relay ──
+// ── 回读校验：合法数组 + 存在 insert→dsh-public-relay ──
 let yaml = null;
 try { yaml = createRequire(path.join(dir, 'package.json'))('js-yaml'); } catch { /* 试下个锚点 */ }
 if (!yaml) { try { yaml = createRequire(import.meta.url)('js-yaml'); } catch { yaml = null; } }

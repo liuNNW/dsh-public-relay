@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * clean-relay-rows.mjs — 清理 cordis.patch.yml 里 dsh-relay 的无效/重复条目
+ * clean-relay-rows.mjs — 清理 cordis.patch.yml 里 dsh-public-relay 的无效/重复条目
  *
  * ── 为什么需要它 ──
  *
@@ -8,7 +8,7 @@
  *   · 带 `insert:`   → 追加新条目（唯一能新增插件的形态）
  *   · 不带 `insert:` → 按 id 找**已存在**的条目来改；找不到就 warn + continue 静默丢弃
  *
- * 所以裸写的 `- id: dsh-relay` 完全无效，却会让人以为「已经配好了」。
+ * 所以裸写的 `- id: dsh-public-relay` 完全无效，却会让人以为「已经配好了」。
  * set-relay-row.mjs 的早期版本还可能在已有裸条目时又插一个 insert 块，
  * 造成同一插件在文件里出现两份。
  *
@@ -44,7 +44,7 @@ if (!fs.existsSync(patchPath)) {
   process.exit(1);
 }
 
-const ROW_ID = 'dsh-relay';
+const ROW_ID = 'dsh-public-relay';
 const TAG = 'clean-relay-rows';
 
 function loadYaml() {

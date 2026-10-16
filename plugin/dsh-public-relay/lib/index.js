@@ -1,5 +1,5 @@
 /**
- * index.js — dsh-relay 宿主端
+ * index.js — dsh-public-relay 宿主端
  *
  * 宿主半职责：
  *   1. 从 ctx.webServer 读**本进程真实监听端口**（UI 上「当前 dsh 端口」的来源，
@@ -7,7 +7,7 @@
  *   2. 按配置启动/停止内嵌中转（lib/relay.js），配置变更即时生效；
  *   3. 用 installSettingsSection 把 Config 注册成 settings 命名空间 —— 这是
  *      「设置 → 插件 → DSH 中转」那张配置卡片的数据来源（与 MiMo 视觉识别同构）；
- *   4. 在 ctx.webServer 上注册 /dsh-relay/* 路由，供 UI 读状态、启停，以及
+ *   4. 在 ctx.webServer 上注册 /dsh-public-relay/* 路由，供 UI 读状态、启停，以及
  *      在原语不可用时提供兜底表单的读写通道。
  *
  * 关于注入：只硬依赖 webServer。settings / tools 走软获取，缺失时分别退回
@@ -21,7 +21,7 @@ import {
   Config, DEFAULTS, SETTINGS_NAMESPACE, diffFromDefaults, normalizeConfig,
 } from './config.js';
 
-export const name = 'dsh-relay';
+export const name = 'dsh-public-relay';
 
 /** 导出 Config：宿主据此生成设置页表单。 */
 export { Config };
@@ -30,7 +30,7 @@ export { Config };
 export const inject = ['webServer'];
 
 /** 路由前缀。 */
-const ROUTE_PREFIX = '/dsh-relay';
+const ROUTE_PREFIX = '/dsh-public-relay';
 
 /** 与 dshmarket 一致的 JSON 应答。 */
 function sendJson(response, status, payload) {
@@ -102,7 +102,7 @@ async function readJsonBody(request, maxBytes = 16 * 1024) {
 
 export function apply(ctx, pluginConfig) {
   const log = (level, message) => {
-    const line = `[dsh-relay] ${message}`;
+    const line = `[dsh-public-relay] ${message}`;
     if (level === 'error') ctx.logger?.error?.(line) ?? console.error(line);
     else if (level === 'warn') ctx.logger?.warn?.(line) ?? console.warn(line);
     else ctx.logger?.info?.(line) ?? console.log(line);
@@ -249,7 +249,7 @@ export function apply(ctx, pluginConfig) {
     if (settings && typeof settings.register === 'function') {
       const scope = settings.register(SETTINGS_NAMESPACE, Config, { base: pluginConfig ?? {} });
       source = () => scope.get();
-      ctx.effect(() => scope.watch(() => { void reconcile('settings'); }), 'dsh-relay: settings watch');
+      ctx.effect(() => scope.watch(() => { void reconcile('settings'); }), 'dsh-public-relay: settings watch');
       settingsWired = true;
       log('info', `已注册设置命名空间 ${SETTINGS_NAMESPACE}（设置 → 插件 → DSH 中转）`);
     }
@@ -260,7 +260,7 @@ export function apply(ctx, pluginConfig) {
     log('info', 'settings 未接线：若宿主自动注册了 Config 也会生效；否则设置页无表单，状态与启停照常');
   }
 
-  // ── HTTP 路由：/dsh-relay/* ──
+  // ── HTTP 路由：/dsh-public-relay/* ──
   const routeDisposer = ctx.webServer.register({
     kind: 'prefix',
     path: ROUTE_PREFIX,
@@ -325,7 +325,7 @@ export function apply(ctx, pluginConfig) {
           return sendJson(response, result.ok ? 200 : 502, result);
         }
 
-        return sendJson(response, 404, { ok: false, error: `unknown dsh-relay route: ${route}` });
+        return sendJson(response, 404, { ok: false, error: `unknown dsh-public-relay route: ${route}` });
       } catch (error) {
         const message = error?.message || String(error);
         log('error', `路由 ${route} 出错：${message}`);
@@ -383,7 +383,7 @@ export function apply(ctx, pluginConfig) {
       routeDisposer?.();
       void relay.stop();
     };
-  }, 'dsh-relay: relay lifecycle + http routes');
+  }, 'dsh-public-relay: relay lifecycle + http routes');
 
   // ── 可选：全局工具（tools 服务缺失时静默跳过）──
   void (async () => {
@@ -405,7 +405,7 @@ export function apply(ctx, pluginConfig) {
     try {
       ctx.effect(() => tools.register(defineTool({
         name: 'relay_status',
-        description: 'Report the dsh-relay plugin: the real dsh port this process is serving on, the relay listen port and upstream target, whether the relay is running, its error state, and the effective configuration. Call this whenever the user asks which port dsh is on or what the relay is doing.',
+        description: 'Report the dsh-public-relay plugin: the real dsh port this process is serving on, the relay listen port and upstream target, whether the relay is running, its error state, and the effective configuration. Call this whenever the user asks which port dsh is on or what the relay is doing.',
         parameters: {},
         output: jsonOutput,
         execute: async () => snapshot(),
@@ -413,7 +413,7 @@ export function apply(ctx, pluginConfig) {
 
       ctx.effect(() => tools.register(defineTool({
         name: 'relay_control',
-        description: "Start, stop or toggle the dsh-relay TCP relay, or read its status. action must be one of 'start', 'stop', 'toggle', 'status'. The relay forwards a local port to this dsh process with Host/Origin rewriting, and start/stop take effect immediately without a restart.",
+        description: "Start, stop or toggle the dsh-public-relay TCP relay, or read its status. action must be one of 'start', 'stop', 'toggle', 'status'. The relay forwards a local port to this dsh process with Host/Origin rewriting, and start/stop take effect immediately without a restart.",
         // 注意参数形状：defineTool 的 parameters 是「属性表」
         // （每个键一个 ParameterPropertySpec），不是 JSON Schema 的
         // {type:'object',properties} 包装 —— 写成后者会在注册期抛

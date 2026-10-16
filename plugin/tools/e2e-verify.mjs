@@ -9,7 +9,7 @@
  * 它做的事：
  *   1. 在临时目录建一个最小 DSH_HOME（web profile + 干净 credentials）
  *   2. 按与 install.ps1 完全相同的方式装入本插件（profile 本地 + insert 条目）
- *   3. 先跑 dump-config 验证组合树真的含 dsh-relay
+ *   3. 先跑 dump-config 验证组合树真的含 dsh-public-relay
  *   4. 再真实启动 dsh web，等它 listen，然后请求插件路由
  *   5. 全程收集日志，最后清理
  *
@@ -21,7 +21,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 
-const PLUGIN_SRC = path.resolve(import.meta.dirname, '..', 'dsh-relay');
+const PLUGIN_SRC = path.resolve(import.meta.dirname, '..', 'dsh-public-relay');
 const REAL_PROFILES = path.join(
   process.env.DSH_HOME || path.join(os.homedir(), '.dsh'),
   'profiles',
@@ -83,7 +83,7 @@ async function main() {
   writeNoBom(path.join(tmpRoot, '.credentials.yaml'), 'version: "1"\nrefs: {}\nrecords: {}\n');
 
   // 2. 装插件（与 install.ps1 相同方式）
-  const dst = path.join(webDir, 'node_modules', 'dsh-relay');
+  const dst = path.join(webDir, 'node_modules', 'dsh-public-relay');
   fs.mkdirSync(path.join(dst, 'lib'), { recursive: true });
   for (const f of ['package.json', 'cordis.patch.yml']) {
     fs.copyFileSync(path.join(PLUGIN_SRC, f), path.join(dst, f));
@@ -109,20 +109,20 @@ async function main() {
 
   const env = { DSH_HOME: tmpRoot };
 
-  // 5. dump-config：组合树必须含 dsh-relay
+  // 5. dump-config：组合树必须含 dsh-public-relay
   head('dump-config 组合树检查');
   const dump = spawnSync('dsh', ['--profile', 'web', '--dump-config'], { env: { ...process.env, ...env }, encoding: 'utf8', shell: true, timeout: 120000 });
   const dumpText = `${dump.stdout || ''}${dump.stderr || ''}`;
-  const inTree = /dsh-relay/.test(dump.stdout || '');
+  const inTree = /dsh-public-relay/.test(dump.stdout || '');
   say(`  退出码 ${dump.status}`);
   if (!inTree) {
-    say('  ✗ 组合树不含 dsh-relay；dump 输出尾部：');
+    say('  ✗ 组合树不含 dsh-public-relay；dump 输出尾部：');
     for (const l of dumpText.split('\n').slice(-12)) say(`    ${l}`);
     return 1;
   }
-  say('  ✓ 组合树含 dsh-relay');
+  say('  ✓ 组合树含 dsh-public-relay');
   const around = (dump.stdout || '').split('\n');
-  const idx = around.findIndex((l) => /dsh-relay/.test(l));
+  const idx = around.findIndex((l) => /dsh-public-relay/.test(l));
   if (idx >= 0) for (const l of around.slice(Math.max(0, idx - 1), idx + 8)) say(`    ${l}`);
 
   // 6. 真实启动 dsh web
@@ -146,17 +146,17 @@ async function main() {
   const errText = readLog(boot.errFile);
 
   head('插件加载证据');
-  const relayLogs = outText.split('\n').filter((l) => /dsh-relay/.test(l));
+  const relayLogs = outText.split('\n').filter((l) => /dsh-public-relay/.test(l));
   if (relayLogs.length > 0) {
     for (const l of relayLogs) say(`  ${l.trim()}`);
   } else {
-    say('  日志里没有 dsh-relay 行');
+    say('  日志里没有 dsh-public-relay 行');
   }
 
   // 7. 请求插件路由（最能证明宿主半真的挂上了）
   head('宿主半路由探测');
   const probe = spawnSync('powershell', ['-NoProfile', '-Command',
-    "try { $r = Invoke-WebRequest 'http://127.0.0.1:3091/dsh-relay/status' -UseBasicParsing -TimeoutSec 6; \"$($r.StatusCode) $($r.Content)\" } catch { 'ERR ' + $_.Exception.Message }"],
+    "try { $r = Invoke-WebRequest 'http://127.0.0.1:3091/dsh-public-relay/status' -UseBasicParsing -TimeoutSec 6; \"$($r.StatusCode) $($r.Content)\" } catch { 'ERR ' + $_.Exception.Message }"],
     { encoding: 'utf8', timeout: 20000 });
   say(`  ${String(probe.stdout || '').trim().slice(0, 400)}`);
 

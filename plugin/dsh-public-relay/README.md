@@ -1,6 +1,6 @@
-# dsh-relay — DSH 中转插件
+# dsh-public-relay — DSH 中转插件
 
-把工作区根的 `dsh-relay.js` 脚本改造成**常驻 DSH 插件**：随 dsh 启动加载，在**本进程内**把 dsh 自己的端口中转出去，并在设置页显示当前真实端口、随时启停。
+把工作区根的 `dsh-public-relay.js` 脚本改造成**常驻 DSH 插件**：随 dsh 启动加载，在**本进程内**把 dsh 自己的端口中转出去，并在设置页显示当前真实端口、随时启停。
 
 ---
 
@@ -45,13 +45,27 @@
 不提示的话用户只会看到「还是要 token」而找不到原因。
 
 配置表单是**自绘**的（不是 MiMo 那种 `SettingsFormModel` 生成）：两个座位的注入面刻意
-留空，页面数据全部走自己的 `/dsh-relay/*` 路由。原因见 `lib/client.js` 顶部注释 ——
+留空，页面数据全部走自己的 `/dsh-public-relay/*` 路由。原因见 `lib/client.js` 顶部注释 ——
 早期版本依赖 `configForms`，那个服务并不在本宿主的客户端服务目录里，导致座位永远
 不就绪、设置里怎么都看不到插件。
 
 ---
 
 ## 安装
+
+### 从市场 / npm 装（推荐，普通用户）
+
+```sh
+# 走过审的插件市场
+dsh plugin --profile web add dsh-public-relay
+
+# 或直接从仓库装（首次会要 allowBuilds 授权，按提示重试即可）
+dsh plugin --profile web add github:liuNNW/dsh-public-relay#path:/plugin/dsh-public-relay
+```
+
+桌面端改用 `--profile desktop`，并且**必须先完全关闭应用**。
+
+### 从本仓库源码装（开发）
 
 ```powershell
 # 默认装到 desktop profile（Electron 版 dsh 用的那个）
@@ -64,12 +78,15 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Profile web
 powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 ```
 
+> `install.ps1` 是给**本仓库源码布局**用的（它按 `plugin/` 相对路径找源码）。
+> 从 npm / 市场装的话不需要这一步 —— 包已经就位，只要重启 dsh。
+
 安装脚本做四件事，任何一步失败都会自动还原全部改动：
 
 1. 备份 `profile/cordis.patch.yml` 与 `profile/package.json`
-2. 把 `plugin/dsh-relay` 拷到 **`$DSH_HOME/profiles/<profile>/node_modules/dsh-relay`**
-3. 在 profile 自己的 `cordis.patch.yml` 里写一条显式 `- id: dsh-relay` 条目
-4. 校验解析路径 + 跑四套测试（共 199 项断言）
+2. 把 `plugin/dsh-public-relay` 拷到 **`$DSH_HOME/profiles/<profile>/node_modules/dsh-public-relay`**
+3. 在 profile 自己的 `cordis.patch.yml` 里写一条显式 `- id: dsh-public-relay` 条目
+4. 校验解析路径 + 跑四套测试（共 222 项断言）
 
 **首次生效需要完全退出 dsh 再打开**（含系统托盘；Electron 关窗口不杀进程）。之后启停都不用重启。
 
@@ -110,7 +127,7 @@ error: profile "desktop" is managed exclusively by the Electron application
 配置有两层，后者覆盖前者：
 
 1. 插件行的 `config:`（写在 profile 补丁里，作为部署默认值）
-2. **设置命名空间** —— `lib/index.js` 用 `ctx.get('settings').register('dsh-relay', Config)`
+2. **设置命名空间** —— `lib/index.js` 用 `ctx.get('settings').register('dsh-public-relay', Config)`
    把 schema 注册成 settings 命名空间，于是设置页里改的值就是权威来源
    （用户层 > 本插件 composition base）。`settings` 服务不可用时退回插件的
    entry config，状态与启停照常，只是改不了参数。
@@ -155,11 +172,11 @@ error: profile "desktop" is managed exclusively by the Electron application
 
 ---
 
-## 与独立脚本 `dsh-relay.js` 的关系
+## 与独立脚本 `dsh-public-relay.js` 的关系
 
 两者是**独立实现**，可以共存：
 
-- `dsh-relay.js`：独立进程 + dsh web 守护 + 崩溃重启。适合不用插件、想单独跑中转的场景。
+- `dsh-public-relay.js`：独立进程 + dsh web 守护 + 崩溃重启。适合不用插件、想单独跑中转的场景。
 - 本插件：跑在 dsh 进程内，无子进程可守（宿主本来就不会退出），不需要 watchdog。
 
 端口的语义以**插件 UI** 为准。插件的 `lib/relay.js` 从脚本移植，并去掉了四处「独立进程」假设：
@@ -199,7 +216,7 @@ node plugin\tools\fix-web-patch.mjs <path-to-cordis.patch.yml> --check  # 只检
 ```
 plugin/
   install.ps1                     安装 / 回滚
-  tools/set-relay-row.mjs         写/更新 profile 里的 dsh-relay 条目（YAML 安全）
+  tools/set-relay-row.mjs         写/更新 profile 里的 dsh-public-relay 条目（YAML 安全）
   tools/clean-relay-rows.mjs      收敛：只留一条有效 insert，清裸条目/重复条目
   tools/repair-patch-array.mjs    修「顶层多个文档」的 cordis.patch.yml
   tools/fix-web-patch.mjs         修补丁层顶层数组（纯注释文件解析为 null 的情况）
@@ -217,7 +234,7 @@ plugin/
   tests/client-half.mjs           浏览器半：51 项断言
   tests/dsh-session.spec.mjs      dsh 会话代签：48 项断言
   tests/resolve-deps.mjs          测试用的 dsh 模块解析引导
-  dsh-relay/
+  dsh-public-relay/
     package.json                  dsh.bundle.patch + dsh.client 声明
     cordis.patch.yml              bundle 层（bundles 方式安装时用）
     lib/relay.js                  中转核心（纯库，无进程副作用）
@@ -237,8 +254,8 @@ node plugin\tests\dsh-session.spec.mjs
 ```
 
 > 测试从工作区运行时需要能解析 dsh 自带模块（`@deepseek-ai/schemastery` 等）。
-> 开发时在 `plugin/dsh-relay/` 下建一个指向 dsh 模块目录的 junction 即可（已 gitignore）：
-> `cmd /c mklink /J plugin\dsh-relay\node_modules C:\Users\<你>\.dsh\profiles\node_modules`
+> 开发时在 `plugin/dsh-public-relay/` 下建一个指向 dsh 模块目录的 junction 即可（已 gitignore）：
+> `cmd /c mklink /J plugin\dsh-public-relay\node_modules C:\Users\<你>\.dsh\profiles\node_modules`
 
 ---
 
@@ -263,7 +280,7 @@ Electron 的客户端页面跑在 **`dsh-app://app/`** 下，该协议被注册�
 | `http(s)` 且 Origin 与 Host **同 authority** | 放行 | 正常同源（含隧道域名） |
 | `http(s)` 但 authority 不一致 | **403** | 真跨站，仍拒绝 |
 
-`GET /dsh-relay/status` 没有这道校验，所以即使写操作被拒状态仍能显示 ——
+`GET /dsh-public-relay/status` 没有这道校验，所以即使写操作被拒状态仍能显示 ——
 症状就是「面板看得到，但按钮点了没反应」。
 
 403 的响应体现在带 `detail`（`origin=… host=…`），便于直接看出是哪一种不匹配。
@@ -413,7 +430,7 @@ node plugin\tools\repair-patch-array.mjs <path-to-cordis.patch.yml>
 
 **公网能连但插件列表为空**
 force-loopback 的正则失配（dsh 升级后可能发生）。看日志里的
-`[dsh-relay] force-loopback: 未找到目标模式`，并把新版本的判定式加进
+`[dsh-public-relay] force-loopback: 未找到目标模式`，并把新版本的判定式加进
 `lib/relay.js` 的 `LOOPBACK_PATTERNS`。浏览器 `Ctrl+F5` 硬刷新。
 
 **UI 上状态是「端口被占用」**

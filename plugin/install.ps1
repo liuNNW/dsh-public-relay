@@ -1,4 +1,4 @@
-﻿# dsh-relay 安装脚本（配置卡片版）
+﻿# dsh-public-relay 安装脚本（配置卡片版）
 #
 # 装到目标 profile 的**本地** node_modules（与 @deepseek-ai/dsh-mimo-vision 同位置）+ 在
 # profile 的 cordis.patch.yml 里写一行显式条目。
@@ -32,27 +32,27 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$PluginSrc = Join-Path $PSScriptRoot 'dsh-relay'
+$PluginSrc = Join-Path $PSScriptRoot 'dsh-public-relay'
 $ProfilesDir = Join-Path $DshHome 'profiles'
 $ProfileDir = Join-Path $ProfilesDir $Profile
-$PluginDst = Join-Path $ProfileDir 'node_modules\dsh-relay'
+$PluginDst = Join-Path $ProfileDir 'node_modules\dsh-public-relay'
 $PatchFile = Join-Path $ProfileDir 'cordis.patch.yml'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
-function Say([string]$m) { Write-Host "[dsh-relay] $m" }
-function Warn([string]$m) { Write-Host "[dsh-relay] $m" -ForegroundColor Yellow }
-function Good([string]$m) { Write-Host "[dsh-relay] $m" -ForegroundColor Green }
-function Bad([string]$m) { Write-Host "[dsh-relay] $m" -ForegroundColor Red }
+function Say([string]$m) { Write-Host "[dsh-public-relay] $m" }
+function Warn([string]$m) { Write-Host "[dsh-public-relay] $m" -ForegroundColor Yellow }
+function Good([string]$m) { Write-Host "[dsh-public-relay] $m" -ForegroundColor Green }
+function Bad([string]$m) { Write-Host "[dsh-public-relay] $m" -ForegroundColor Red }
 
 # ─────────────────────────── 回滚 ───────────────────────────
 
 if ($Revert) {
-  Say "回滚：移除 $Profile profile 的 dsh-relay"
+  Say "回滚：移除 $Profile profile 的 dsh-public-relay"
 
   # 1. 清掉 cordis.patch.yml 里的条目（当前生效的装载路径）
   $clean = Join-Path $PSScriptRoot 'tools\clean-relay-rows.mjs'
   if ((Test-Path $clean) -and (Test-Path $PatchFile)) {
-    if (Select-String -Path $PatchFile -Pattern 'dsh-relay' -Quiet) {
+    if (Select-String -Path $PatchFile -Pattern 'dsh-public-relay' -Quiet) {
       & node $clean $ProfileDir --remove
     }
   }
@@ -60,7 +60,7 @@ if ($Revert) {
   # 2. 从 dsh.profile.bundles 里摘掉（早期版本可能写在这里）
   $bundler = Join-Path $PSScriptRoot 'tools\add-bundle.mjs'
   if ((Test-Path $bundler) -and (Test-Path (Join-Path $ProfileDir 'package.json'))) {
-    & node $bundler (Join-Path $ProfileDir 'package.json') 'dsh-relay' --remove
+    & node $bundler (Join-Path $ProfileDir 'package.json') 'dsh-public-relay' --remove
   }
 
   # 3. 删除插件包
@@ -69,20 +69,20 @@ if ($Revert) {
     Say "已删除 $PluginDst"
   }
   # 共享目录里的旧副本也清掉（早期版本装在这里）
-  $shared = Join-Path $ProfilesDir 'node_modules\dsh-relay'
+  $shared = Join-Path $ProfilesDir 'node_modules\dsh-public-relay'
   if (Test-Path $shared) { Remove-Item $shared -Recurse -Force; Say "已删除共享目录副本 $shared" }
 
   # 4. 回读确认已清干净
   $leftBundles = $false
   $leftPatch = $false
   if (Test-Path (Join-Path $ProfileDir 'package.json')) {
-    $leftBundles = (Get-Content (Join-Path $ProfileDir 'package.json') -Raw) -match '"dsh-relay"'
+    $leftBundles = (Get-Content (Join-Path $ProfileDir 'package.json') -Raw) -match '"dsh-public-relay"'
   }
   if (Test-Path $PatchFile) {
-    $leftPatch = Select-String -Path $PatchFile -Pattern 'dsh-relay' -Quiet
+    $leftPatch = Select-String -Path $PatchFile -Pattern 'dsh-public-relay' -Quiet
   }
-  if ($leftBundles) { Warn 'profile package.json 里仍有 dsh-relay，请手工检查' } else { Say 'bundles 已清干净' }
-  if ($leftPatch) { Warn "$PatchFile 里仍有 dsh-relay，请手工检查" } else { Say 'patch 文件已清干净' }
+  if ($leftBundles) { Warn 'profile package.json 里仍有 dsh-public-relay，请手工检查' } else { Say 'bundles 已清干净' }
+  if ($leftPatch) { Warn "$PatchFile 里仍有 dsh-public-relay，请手工检查" } else { Say 'patch 文件已清干净' }
 
   Good '回滚完成。重启 dsh 后插件消失。'
   exit 0
@@ -117,7 +117,7 @@ const entry = fs.existsSync(path.join(dir, 'lib', 'index.mjs'))
 const hasVolatile = fs.readFileSync(entry, 'utf8').includes('volatile');
 console.log(version + '|' + (hasVolatile ? 'volatile-ok' : 'no-volatile'));
 '@
-$probeFile = Join-Path $env:TEMP "dsh-relay-schema-probe.js"
+$probeFile = Join-Path $env:TEMP "dsh-public-relay-schema-probe.js"
 Set-Content -LiteralPath $probeFile -Value $schemaProbeScript -Encoding UTF8
 $schemaCheck = & node $probeFile (Join-Path $ProfileDir 'package.json') 2>&1
 Remove-Item $probeFile -Force -ErrorAction SilentlyContinue
@@ -170,7 +170,7 @@ try {
   #
   # 为什么必须是 `- insert:`：dsh 的 applyEntryPatches 把 patch 分两类 ——
   #   带 insert 的 → 追加新条目；不带 insert 的 → 按 id 找**已存在**条目来改，
-  #   找不到就 warn + continue **静默丢弃**。所以裸 `- id: dsh-relay` 写了等于没写。
+  #   找不到就 warn + continue **静默丢弃**。所以裸 `- id: dsh-public-relay` 写了等于没写。
   #
   # 为什么这条路径可用：dsh 的 HMR 实时监视 profile 的 cordis.patch.yml，
   # 写入后无需重启即挂载（实测：status 从 inactive 变 schema，中转端口随即监听）。
@@ -190,10 +190,10 @@ try {
   # 2b-2. bundles 里不能同时有它：两条路径同时用会把同一个 id 插入两次
   $bundler = Join-Path $PSScriptRoot 'tools\add-bundle.mjs'
   if (Test-Path $bundler) {
-    $inBundles = (Get-Content (Join-Path $ProfileDir 'package.json') -Raw) -match '"dsh-relay"'
+    $inBundles = (Get-Content (Join-Path $ProfileDir 'package.json') -Raw) -match '"dsh-public-relay"'
     if ($inBundles) {
       Say '移除 bundles 里的重复声明（避免同一 id 被插入两次）'
-      & node $bundler (Join-Path $ProfileDir 'package.json') 'dsh-relay' --remove | Out-Null
+      & node $bundler (Join-Path $ProfileDir 'package.json') 'dsh-public-relay' --remove | Out-Null
     }
   }
 
@@ -225,7 +225,7 @@ const { createRequire } = require('module');
 const path = require('path'); const fs = require('fs');
 const anchor = process.argv[2];
 const req = createRequire(anchor);
-const need = ['dsh-relay', '@deepseek-ai/schemastery', '@deepseek-ai/dsh-tools'];
+const need = ['dsh-public-relay', '@deepseek-ai/schemastery', '@deepseek-ai/dsh-tools'];
 const bad = [];
 let relayDir = null;
 for (const n of need) {
@@ -235,7 +235,7 @@ for (const n of need) {
     if (fs.existsSync(p)) { f = p; break; }
   }
   if (f === null) bad.push(n);
-  else if (n === 'dsh-relay') relayDir = path.dirname(f);
+  else if (n === 'dsh-public-relay') relayDir = path.dirname(f);
 }
 if (bad.length > 0) { console.error('unresolvable: ' + bad.join(', ')); process.exit(1); }
 for (const f of ['lib/index.js', 'lib/client.js', 'lib/relay.js', 'lib/config.js', 'lib/dsh-cookie.js']) {
@@ -243,7 +243,7 @@ for (const f of ['lib/index.js', 'lib/client.js', 'lib/relay.js', 'lib/config.js
 }
 console.log('all dependencies resolvable');
 '@
-  $resolveFile = Join-Path $env:TEMP "dsh-relay-resolve-probe.js"
+  $resolveFile = Join-Path $env:TEMP "dsh-public-relay-resolve-probe.js"
   Set-Content -LiteralPath $resolveFile -Value $resolveProbeScript -Encoding UTF8
   $resolveCheck = & node $resolveFile (Join-Path $ProfileDir 'package.json') 2>&1
   Remove-Item $resolveFile -Force -ErrorAction SilentlyContinue

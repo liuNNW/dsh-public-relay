@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * host-integration.mjs — dsh-relay 宿主半集成测试
+ * host-integration.mjs — dsh-public-relay 宿主半集成测试
  *
  * 用一个假 ctx 真实 import lib/index.js 并 apply()，验证：
  *   · 从 ctx.webServer 读到真实端口（而不是硬编码）
- *   · /dsh-relay/status 与 /dsh-relay/control 路由真的注册并可调用
+ *   · /dsh-public-relay/status 与 /dsh-public-relay/control 路由真的注册并可调用
  *   · 开关能真正改变中转监听状态（start/stop/toggle）
  *   · effect 清理时自动停中转并释放端口（这是"永久插件 + 随时关"的基础）
  *   · 配置持久化走 credentials 服务（写/读回）
@@ -237,14 +237,14 @@ async function main() {
   const relayPort = await freePort();
 
   const pluginEntry = pathToFileURL(
-    path.resolve(import.meta.dirname, '..', 'dsh-relay', 'lib', 'index.js'),
+    path.resolve(import.meta.dirname, '..', 'dsh-public-relay', 'lib', 'index.js'),
   ).href;
   const mod = await import(pluginEntry);
   const plugin = mod.default ?? mod;
   const applyFn = plugin.apply ?? mod.apply;
 
   section('插件形状');
-  check('导出 name = dsh-relay', (plugin.name ?? mod.name) === 'dsh-relay', `got ${plugin.name ?? mod.name}`);
+  check('导出 name = dsh-public-relay', (plugin.name ?? mod.name) === 'dsh-public-relay', `got ${plugin.name ?? mod.name}`);
   const inject = plugin.inject ?? mod.inject;
   check('inject 含 webServer', Array.isArray(inject) && inject.includes('webServer'), `got ${JSON.stringify(inject)}`);
   check('导出 apply 函数', typeof applyFn === 'function', 'apply missing');
@@ -267,7 +267,7 @@ async function main() {
 
   section('读取本进程真实端口（不硬编码）');
   {
-    const status = await callRoute(host, 'GET', '/dsh-relay/status');
+    const status = await callRoute(host, 'GET', '/dsh-public-relay/status');
     check('status 路由已注册', status.status === 200, `got ${status.status}`);
     const body = JSON.parse(status.body);
     check('dshPort 等于 ctx.webServer.port', body.dshPort === dshPort, `got ${body.dshPort}, expected ${dshPort}`);
@@ -284,7 +284,7 @@ async function main() {
     // 浏览器对**跨站写请求必然附带 Origin**，所以「没有 Origin」不可能来自跨站。
     // dsh 自己的 isTrustedApiRequest 也是这么判的（origin === undefined → true），
     // 本插件与之对齐。
-    const noOrigin = await callRoute(host, 'POST', '/dsh-relay/control', { body: { action: 'status' } });
+    const noOrigin = await callRoute(host, 'POST', '/dsh-public-relay/control', { body: { action: 'status' } });
     check('无 Origin 的 POST → 放行（与 dsh 自身策略一致）', noOrigin.status === 200, `got ${noOrigin.status}`);
 
     // ── Electron 自渲染页面 → 放行（本次 403 bug 的回归锁）──
@@ -293,7 +293,7 @@ async function main() {
     // standard+secure，页面 fetch 会带这个 Origin。
     // 若按「Origin 必须等于 Host」处理，`new URL('dsh-app://app').host` 是 "app"，
     // 与真实 Host 永不相等 → 一律 403，表现就是「设置页按钮点了没反应」。
-    const electron = await callRoute(host, 'POST', '/dsh-relay/control', {
+    const electron = await callRoute(host, 'POST', '/dsh-public-relay/control', {
       headers: { origin: 'dsh-app://app', host: `127.0.0.1:${host.port}` },
       body: { action: 'status' },
     });
@@ -301,7 +301,7 @@ async function main() {
       `got ${electron.status} ${electron.body.slice(0, 120)}`);
 
     // ── 真正的跨源 → 仍拒绝（安全边界不放宽）──
-    const crossOrigin = await callRoute(host, 'POST', '/dsh-relay/control', {
+    const crossOrigin = await callRoute(host, 'POST', '/dsh-public-relay/control', {
       // 页面在 evil.example.com，请求发往本机：Origin 是攻击者域名，Host 是真实地址
       headers: { origin: 'http://evil.example.com', host: `127.0.0.1:${host.port}` },
       body: { action: 'status' },
@@ -309,38 +309,38 @@ async function main() {
     check('跨源 POST → 403', crossOrigin.status === 403, `got ${crossOrigin.status}`);
 
     // 隧道场景下的跨站也必须拒（Origin 与 Host 不同 authority）
-    const tunnelCross = await callRoute(host, 'POST', '/dsh-relay/control', {
+    const tunnelCross = await callRoute(host, 'POST', '/dsh-public-relay/control', {
       headers: { origin: 'https://evil.example.com', host: 'example.com:3091' },
       body: { action: 'status' },
     });
     check('隧道 authority 下的跨源 POST → 403', tunnelCross.status === 403, `got ${tunnelCross.status}`);
 
     // ── http 同源 → 放行 ──
-    const okOrigin = await callRoute(host, 'POST', '/dsh-relay/control', {
+    const okOrigin = await callRoute(host, 'POST', '/dsh-public-relay/control', {
       headers: { origin: `http://127.0.0.1:${dshPort}` },
       body: { action: 'status' },
     });
     check('http 同源 POST → 200', okOrigin.status === 200, `got ${okOrigin.status}`);
 
     // 隧道同源（Origin 与 Host 一致）→ 放行
-    const tunnelSame = await callRoute(host, 'POST', '/dsh-relay/control', {
+    const tunnelSame = await callRoute(host, 'POST', '/dsh-public-relay/control', {
       headers: { origin: 'https://example.com:3091', host: 'example.com:3091' },
       body: { action: 'status' },
     });
     check('隧道同源 POST → 200', tunnelSame.status === 200, `got ${tunnelSame.status}`);
 
     // /config 走同一判据
-    const cfgElectron = await callRoute(host, 'POST', '/dsh-relay/config', {
+    const cfgElectron = await callRoute(host, 'POST', '/dsh-public-relay/config', {
       headers: { origin: 'dsh-app://app', host: `127.0.0.1:${host.port}` },
       body: { config: { listenPort: relayPort } },
     });
     check('Electron Origin 下 /config 也放行', cfgElectron.status === 200,
       `got ${cfgElectron.status} ${cfgElectron.body.slice(0, 120)}`);
 
-    const getOnControl = await callRoute(host, 'GET', '/dsh-relay/control');
+    const getOnControl = await callRoute(host, 'GET', '/dsh-public-relay/control');
     check('control 只接受 POST', getOnControl.status === 405, `got ${getOnControl.status}`);
 
-    const unknown = await callRoute(host, 'GET', '/dsh-relay/nope');
+    const unknown = await callRoute(host, 'GET', '/dsh-public-relay/nope');
     check('未知子路由 → 404', unknown.status === 404, `got ${unknown.status}`);
   }
 
@@ -348,7 +348,7 @@ async function main() {
   {
     check('启用后端口在监听', await portListening(relayPort) === true, `port ${relayPort} not listening`);
 
-    const stopped = await callRoute(host, 'POST', '/dsh-relay/control', {
+    const stopped = await callRoute(host, 'POST', '/dsh-public-relay/control', {
       headers: { origin: `http://127.0.0.1:${dshPort}` },
       body: { action: 'stop' },
     });
@@ -357,7 +357,7 @@ async function main() {
     check('stop 后状态为 stopped', stopBody.status.state === 'stopped', `got ${stopBody.status.state}`);
     check('stop 后端口已释放', await portListening(relayPort) === false, `port ${relayPort} still listening`);
 
-    const started = await callRoute(host, 'POST', '/dsh-relay/control', {
+    const started = await callRoute(host, 'POST', '/dsh-public-relay/control', {
       headers: { origin: `http://127.0.0.1:${dshPort}` },
       body: { action: 'start' },
     });
@@ -365,7 +365,7 @@ async function main() {
     check('start 返回 ok', startBody.ok === true, started.body);
     check('start 后端口重新监听', await portListening(relayPort) === true, `port ${relayPort} not listening`);
 
-    const toggled = await callRoute(host, 'POST', '/dsh-relay/control', {
+    const toggled = await callRoute(host, 'POST', '/dsh-public-relay/control', {
       headers: { origin: `http://127.0.0.1:${dshPort}` },
       body: { action: 'toggle' },
     });
@@ -376,14 +376,14 @@ async function main() {
 
   section('配置写入（走 settings 命名空间）');
   {
-    const saved = await callRoute(host, 'POST', '/dsh-relay/config', {
+    const saved = await callRoute(host, 'POST', '/dsh-public-relay/config', {
       headers: { origin: `http://127.0.0.1:${dshPort}` },
       body: { config: { enabled: true, listenPort: relayPort, password: 'new-pass' } },
     });
     check('config 路由返回 200', saved.status === 200, `got ${saved.status}`);
 
     // 持久化落在 settings 命名空间里（与设置页同一份存储）
-    const rec = h.settingsStore.get('dsh-relay');
+    const rec = h.settingsStore.get('dsh-public-relay');
     check('settings 命名空间已注册', rec !== undefined, 'namespace missing');
     if (rec) {
       check('命名空间里口令已更新', rec.value.password === 'new-pass', `got ${rec.value.password}`);
@@ -391,9 +391,9 @@ async function main() {
       check('写入推进了 revision', rec.revision > 0, `revision=${rec.revision}`);
     }
 
-    const statusAfter = JSON.parse((await callRoute(host, 'GET', '/dsh-relay/status')).body);
+    const statusAfter = JSON.parse((await callRoute(host, 'GET', '/dsh-public-relay/status')).body);
     check('新口令立即生效（hasPassword=true）', statusAfter.hasPassword === true, `got ${statusAfter.hasPassword}`);
-    check('status 回报 settings 命名空间名', statusAfter.settingsNamespace === 'dsh-relay', `got ${statusAfter.settingsNamespace}`);
+    check('status 回报 settings 命名空间名', statusAfter.settingsNamespace === 'dsh-public-relay', `got ${statusAfter.settingsNamespace}`);
   }
 
   section('自动会话：口令为空时保存的是「用户原意」');
@@ -401,17 +401,17 @@ async function main() {
     // 场景：用户把口令清空、但 autoSession 仍想开着。
     // 归一化会把生效值压成 false（安全硬约束），但**写回存储的必须是原意 true** ——
     // 否则用户下次填回口令时开关已被偷偷关掉，且他完全不知道发生过什么。
-    const saved = await callRoute(host, 'POST', '/dsh-relay/config', {
+    const saved = await callRoute(host, 'POST', '/dsh-public-relay/config', {
       headers: { origin: `http://127.0.0.1:${dshPort}` },
       body: { config: { enabled: true, listenPort: relayPort, password: '', autoSession: true } },
     });
     check('清空口令 + 开着自动会话 → 写入成功', saved.status === 200, `got ${saved.status} ${saved.body}`);
 
-    const rec = h.settingsStore.get('dsh-relay');
+    const rec = h.settingsStore.get('dsh-public-relay');
     check('存储里保留用户原意 autoSession=true',
       rec && rec.value.autoSession === true, JSON.stringify(rec && rec.value.autoSession));
 
-    const snap = JSON.parse((await callRoute(host, 'GET', '/dsh-relay/status')).body);
+    const snap = JSON.parse((await callRoute(host, 'GET', '/dsh-public-relay/status')).body);
     check('生效值被压成 false（安全硬约束）', snap.config.autoSession === false, String(snap.config.autoSession));
     check('原意字段仍是 true', snap.config.autoSessionWanted === true, String(snap.config.autoSessionWanted));
     check('status.session 标记被口令为空压掉',
@@ -419,12 +419,12 @@ async function main() {
       JSON.stringify(snap.session));
 
     // 再把口令填回去 → 开关应自动恢复生效（用户没碰过它）
-    const back = await callRoute(host, 'POST', '/dsh-relay/config', {
+    const back = await callRoute(host, 'POST', '/dsh-public-relay/config', {
       headers: { origin: `http://127.0.0.1:${dshPort}` },
       body: { config: { enabled: true, listenPort: relayPort, password: 'restored-pw', autoSession: true } },
     });
     check('填回口令 → 写入成功', back.status === 200, `got ${back.status}`);
-    const snap2 = JSON.parse((await callRoute(host, 'GET', '/dsh-relay/status')).body);
+    const snap2 = JSON.parse((await callRoute(host, 'GET', '/dsh-public-relay/status')).body);
     check('填回口令后自动会话恢复生效（无需用户再动开关）',
       snap2.config.autoSession === true && snap2.config.autoSessionBlocked === false,
       JSON.stringify({ a: snap2.config.autoSession, b: snap2.config.autoSessionBlocked }));
@@ -432,7 +432,7 @@ async function main() {
 
   section('effect 清理 = 停中转 + 释放端口');
   {
-    await callRoute(host, 'POST', '/dsh-relay/control', {
+    await callRoute(host, 'POST', '/dsh-public-relay/control', {
       headers: { origin: `http://127.0.0.1:${dshPort}` },
       body: { action: 'start' },
     });
@@ -445,7 +445,7 @@ async function main() {
     await new Promise((r) => setTimeout(r, 800));
 
     check('清理后端口已释放', await portListening(relayPort) === false, `port ${relayPort} still listening`);
-    check('清理后路由已注销', h.routes.has('/dsh-relay') === false, 'route still registered');
+    check('清理后路由已注销', h.routes.has('/dsh-public-relay') === false, 'route still registered');
     await host.close();
   }
 
@@ -462,17 +462,17 @@ async function main() {
     const host2 = await startRouteHost(h2.routes);
     await new Promise((r) => setTimeout(r, 600));
 
-    const st = JSON.parse((await callRoute(host2, 'GET', '/dsh-relay/status')).body);
+    const st = JSON.parse((await callRoute(host2, 'GET', '/dsh-public-relay/status')).body);
     check('state=error', st.state === 'error', `got ${st.state}`);
     check("lastError='port-in-use'", st.lastError === 'port-in-use', `got ${st.lastError}`);
     check('路由仍可用（插件没崩）', st.dshPort === dshPort2, `got ${st.dshPort}`);
 
     await new Promise((r) => squatter.close(r));
-    await callRoute(host2, 'POST', '/dsh-relay/control', {
+    await callRoute(host2, 'POST', '/dsh-public-relay/control', {
       headers: { origin: `http://127.0.0.1:${dshPort2}` },
       body: { action: 'start' },
     });
-    const st2 = JSON.parse((await callRoute(host2, 'GET', '/dsh-relay/status')).body);
+    const st2 = JSON.parse((await callRoute(host2, 'GET', '/dsh-public-relay/status')).body);
     check('占用解除后能启用', st2.state === 'running', `got ${st2.state} / ${st2.lastError}`);
 
     for (const e of h2.effects) if (typeof e.cleanup === 'function') e.cleanup();
@@ -544,17 +544,17 @@ async function main() {
     const host3 = await startRouteHost(h3.routes);
     await new Promise((r) => setTimeout(r, 500));
 
-    const st = JSON.parse((await callRoute(host3, 'GET', '/dsh-relay/status')).body);
+    const st = JSON.parse((await callRoute(host3, 'GET', '/dsh-public-relay/status')).body);
     check('state=stopped', st.state === 'stopped', `got ${st.state} / ${st.lastError}`);
     check('未占用端口', await portListening(somePort) === false, `port ${somePort} unexpectedly listening`);
     check('仍能读到 dsh 端口', st.dshPort === quietPort, `got ${st.dshPort}`);
 
     // 关掉之后仍可手动启用
-    await callRoute(host3, 'POST', '/dsh-relay/control', {
+    await callRoute(host3, 'POST', '/dsh-public-relay/control', {
       headers: { origin: `http://127.0.0.1:${quietPort}` },
       body: { action: 'start' },
     });
-    const st2 = JSON.parse((await callRoute(host3, 'GET', '/dsh-relay/status')).body);
+    const st2 = JSON.parse((await callRoute(host3, 'GET', '/dsh-public-relay/status')).body);
     check('enabled=false 后仍可手动启用', st2.state === 'running', `got ${st2.state} / ${st2.lastError}`);
 
     for (const e of h3.effects) if (typeof e.cleanup === 'function') e.cleanup();

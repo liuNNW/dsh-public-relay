@@ -1,0 +1,85 @@
+{
+  "name": "dsh-public-relay",
+  "version": "0.1.0",
+  "description": "把本机 dsh web 端口反向代理出去：Host/Origin 改写过信任栅栏、强制回环改写（公网也能看到插件列表）、HMAC 口令认证、代签 dsh 会话 Cookie（只输中转口令即可进入）、WebSocket 透传；配合内网穿透可直接访问 dsh 界面。 / Reverse-proxy a local DeepSeek Harness web profile out through a tunnel: rewrite Host/Origin for the trust fence, patch the isLoopback check, HMAC passcode auth, sign the dsh session cookie so a passcode alone logs you in, and pass WebSocket through.",
+  "type": "module",
+  "engines": {
+    "node": ">=18",
+    "dsh": ">=0.1.5-rc.1"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./relay": "./lib/relay.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "relay",
+    "proxy",
+    "tunnel",
+    "frp",
+    "reverse-proxy"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liuNNW/dsh-public-relay.git"
+  },
+  "homepage": "https://github.com/liuNNW/dsh-public-relay",
+  "bugs": {
+    "url": "https://github.com/liuNNW/dsh-public-relay/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dshTarget": "0.2.0-rc.2",
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/schemastery": ">=3.18.1",
+    "@deepseek-ai/dsh-client-locale": ">=0.1.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-settings": ">=0.1.0-rc.1",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.1",
+    "react": "^18.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-locale": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-settings": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  }
+}

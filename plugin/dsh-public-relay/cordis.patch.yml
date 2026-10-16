@@ -1,11 +1,11 @@
-# dsh-relay bundle patch 层。
+# dsh-public-relay bundle patch 层。
 #
 # 由 package.json 的 dsh.bundle.patch 声明引用；把本包列进 profile 的
 # dsh.profile.bundles 时，这一层负责插入插件行。
 #
 # 注意：如果改用 profile 自己的 cordis.patch.yml 手写 insert，
 # 就不要再把本包列入 dsh.profile.bundles —— 两条路径同时用会让
-# id `dsh-relay` 被插入两次（Loader 会按重复 id 报冲突）。
+# id `dsh-public-relay` 被插入两次（Loader 会按重复 id 报冲突）。
 - insert:
-    - id: dsh-relay
-      name: dsh-relay
+    - id: dsh-public-relay
+      name: dsh-public-relay

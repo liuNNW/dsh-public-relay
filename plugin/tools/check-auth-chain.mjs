@@ -23,7 +23,7 @@ const relayPort = Number(process.argv[2] ?? 3091);
 const dshPort = Number(process.argv[3] ?? 19387);
 const HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 const profileName = process.env.DSH_PROFILE || 'desktop';
-const pluginDir = path.join(HOME, 'profiles', profileName, 'node_modules', 'dsh-relay');
+const pluginDir = path.join(HOME, 'profiles', profileName, 'node_modules', 'dsh-public-relay');
 
 const problems = [];
 const say = (s = '') => console.log(s);
@@ -74,8 +74,8 @@ if (relayRoot.status === 0) {
 } else {
   const swap = await get(relayPort, '/?token=PROBE_TOKEN_DOES_NOT_MATTER');
   const body = swap.body || '';
-  const isOwnLoginPage = body.includes('dsh-relay 访问口令');
-  const isOwn401 = swap.status === 401 && body.includes('dsh-relay');
+  const isOwnLoginPage = body.includes('dsh-public-relay 访问口令');
+  const isOwn401 = swap.status === 401 && body.includes('dsh-public-relay');
 
   if (swap.status === 0) {
     say(`  ✗ 请求失败：${swap.error}`);
@@ -127,7 +127,7 @@ if (dshRoot.status === 0) {
     return new Promise((resolve) => {
       const body = JSON.stringify({ action: 'status' });
       const req = http.request({
-        host: '127.0.0.1', port: dshPort, method: 'POST', path: '/dsh-relay/control',
+        host: '127.0.0.1', port: dshPort, method: 'POST', path: '/dsh-public-relay/control',
         headers: { ...headers, 'content-length': Buffer.byteLength(body), connection: 'close' },
         agent: false,
       }, (res) => {

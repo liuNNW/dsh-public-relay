@@ -7,7 +7,7 @@ node_modules/
 
 # ───────── 运行时日志（持续追加，不入库）─────────
 *.log
-# dsh-relay 守护日志：dsh-web.log
+# dsh-public-relay 守护日志：dsh-web.log
 # 启动重定向输出：_relay_out.log / _relay_err.log
 
 # ───────── 系统与编辑器杂物 ─────────
@@ -24,4 +24,5 @@ desktop.ini
 *.bak
 
 # 本地开发用的模块解析链接（指向 dsh 的 node_modules，仅测试便利，不入库）
-plugin/dsh-relay/node_modules/
+# 注：上面的通用 `node_modules/` 规则已覆盖它；这里显式写出只为可读性
+plugin/dsh-public-relay/node_modules/

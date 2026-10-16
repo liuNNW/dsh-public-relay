@@ -4,7 +4,7 @@
  *
  * 只读，不改任何东西。逐项检查本插件实际依赖的装载路径：
  *   1. 插件是否装在 profile 本地 node_modules（与 MiMo 同位）
- *   2. profile 的 cordis.patch.yml 是否有 dsh-relay 条目，且顶层是合法数组
+ *   2. profile 的 cordis.patch.yml 是否有 dsh-public-relay 条目，且顶层是合法数组
  *   3. schemastery 版本是否支持 .volatile()（设置页表单的必要条件）
  *   4. 宿主可选的 dsh-tools / dsh-settings 是否可解析
  *   5. 插件源码能否真正 import（含 Config 构造）
@@ -25,8 +25,8 @@ const profileName = pIdx >= 0 && args[pIdx + 1] ? args[pIdx + 1] : 'desktop';
 const HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 const profilesDir = path.join(HOME, 'profiles');
 const profileDir = path.join(profilesDir, profileName);
-const pluginDir = path.join(profileDir, 'node_modules', 'dsh-relay');
-const sharedPluginDir = path.join(profilesDir, 'node_modules', 'dsh-relay');
+const pluginDir = path.join(profileDir, 'node_modules', 'dsh-public-relay');
+const sharedPluginDir = path.join(profilesDir, 'node_modules', 'dsh-public-relay');
 const patchFile = path.join(profileDir, 'cordis.patch.yml');
 const manifest = path.join(profileDir, 'package.json');
 
@@ -37,7 +37,7 @@ function ok(s) { out(`  ✓ ${s}`); }
 function bad(s) { out(`  ✗ ${s}`); problems.push(s); }
 function info(s) { out(`  · ${s}`); }
 
-out('dsh-relay 诊断');
+out('dsh-public-relay 诊断');
 out(`DSH_HOME : ${HOME}`);
 out(`profile  : ${profileName}`);
 
@@ -73,7 +73,7 @@ if (!fs.existsSync(patchFile)) {
   bad(`找不到 ${patchFile}`);
 } else {
   const text = fs.readFileSync(patchFile, 'utf8');
-  const hasRowText = /^-\s*id:\s*dsh-relay\s*$/m.test(text);
+  const hasRowText = /^-\s*id:\s*dsh-public-relay\s*$/m.test(text);
   const hasPlaceholder = /^\s*\[\s*\]\s*$/m.test(text);
   const hasOtherEntry = text.split(/\r?\n/).some((l) => /^- /.test(l));
 
@@ -91,14 +91,14 @@ if (!fs.existsSync(patchFile)) {
 
         // 关键：dsh 的 applyEntryPatches 只对**带 insert:** 的 patch 新增条目；
         // 不带 insert 的按 id 去已有树里找目标，找不到就静默丢弃。
-        // 所以判据是「存在一个 insert 块，其下含 id=dsh-relay」。
+        // 所以判据是「存在一个 insert 块，其下含 id=dsh-public-relay」。
         const insertBlock = doc.find((e) => e && Array.isArray(e.insert)
-          && e.insert.some((r) => r && r.id === 'dsh-relay'));
-        const bareRow = doc.find((e) => e && e.id === 'dsh-relay');
+          && e.insert.some((r) => r && r.id === 'dsh-public-relay'));
+        const bareRow = doc.find((e) => e && e.id === 'dsh-public-relay');
 
         if (insertBlock) {
-          const row = insertBlock.insert.find((r) => r && r.id === 'dsh-relay');
-          ok('含 dsh-relay 条目（insert 结构，会被真正加载）');
+          const row = insertBlock.insert.find((r) => r && r.id === 'dsh-public-relay');
+          ok('含 dsh-public-relay 条目（insert 结构，会被真正加载）');
           const cfg = row.config;
           if (cfg && typeof cfg === 'object') {
             info(`config = ${JSON.stringify(cfg)}`);
@@ -109,7 +109,7 @@ if (!fs.existsSync(patchFile)) {
             info('条目没有 config 段：全部字段走 schema 默认值（允许）');
           }
           if (bareRow) {
-            bad('同时存在裸条目（- id: dsh-relay 不带 insert）：dsh 会静默丢弃它，只会造成困惑');
+            bad('同时存在裸条目（- id: dsh-public-relay 不带 insert）：dsh 会静默丢弃它，只会造成困惑');
             out('      → node plugin/tools/clean-relay-rows.mjs "' + profileDir + '"');
           }
         } else if (bareRow) {
@@ -117,7 +117,7 @@ if (!fs.existsSync(patchFile)) {
           out('      → node plugin/tools/set-relay-row.mjs "' + profileDir + '"');
           out('      → node plugin/tools/clean-relay-rows.mjs "' + profileDir + '"');
         } else {
-          bad('数组里没有 dsh-relay 条目 → 插件不会被加载');
+          bad('数组里没有 dsh-public-relay 条目 → 插件不会被加载');
           out('      → node plugin/tools/set-relay-row.mjs "' + profileDir + '"');
         }
       }
@@ -130,8 +130,8 @@ if (!fs.existsSync(patchFile)) {
     }
   } else {
     info('（本机无 js-yaml，仅文本校验）');
-    if (hasRowText) ok('文本上存在 dsh-relay 条目');
-    else bad('文本上没有 dsh-relay 条目');
+    if (hasRowText) ok('文本上存在 dsh-public-relay 条目');
+    else bad('文本上没有 dsh-public-relay 条目');
     if (hasPlaceholder && hasOtherEntry) bad('同时存在 [] 占位与 - 条目：YAML 顶层会是两个文档，需要修');
   }
 }

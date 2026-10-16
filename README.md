@@ -1,8 +1,17 @@
-# 中转dsh — DSH Web 反向代理中转
+# dsh-public-relay — DSH Web 反向代理中转
 
 配合 **樱花映射（Sakura Frp）TCP 内网穿透**，把本机 `dsh web` 安全地暴露到公网。
 
 零第三方依赖，只用 Node.js 内置模块。
+
+- **npm**：`dsh-public-relay`
+- **仓库**：<https://github.com/liuNNW/dsh-public-relay>
+- **许可证**：MIT
+
+```sh
+# 直接装（市场或 npm）
+dsh plugin --profile web add dsh-public-relay
+```
 
 ---
 
@@ -21,7 +30,7 @@
 ## 快速开始
 
 ```bash
-node dsh-relay.js
+node dsh-public-relay.js
 ```
 
 默认行为：
@@ -38,7 +47,7 @@ node dsh-relay.js
 ## 命令行参数
 
 ```
-node dsh-relay.js [选项]
+node dsh-public-relay.js [选项]
 
 --host <ip>          中转监听地址（默认 127.0.0.1）
 --port <port>        中转监听端口（默认 3081）
@@ -54,10 +63,10 @@ node dsh-relay.js [选项]
 示例：
 
 ```bash
-node dsh-relay.js --port 9000              # 换中转端口
-node dsh-relay.js --password '自定义口令'    # 换口令
-node dsh-relay.js --no-watchdog            # 只跑中转，dsh web 自己起
-node dsh-relay.js --target http://127.0.0.1:3085
+node dsh-public-relay.js --port 9000              # 换中转端口
+node dsh-public-relay.js --password '自定义口令'    # 换口令
+node dsh-public-relay.js --no-watchdog            # 只跑中转，dsh web 自己起
+node dsh-public-relay.js --target http://127.0.0.1:3085
 ```
 
 > 口令改为公网可猜的弱口令前请三思；`--password ''` 会完全关闭认证。
@@ -70,7 +79,7 @@ node dsh-relay.js --target http://127.0.0.1:3085
 公网浏览器
    │  (樱花映射隧道)
    ▼
-dsh-relay.js  监听 127.0.0.1:3081
+dsh-public-relay.js  监听 127.0.0.1:3081
    ├─ authGate()          口令认证（Cookie 会话 / 登录页 / 401）
    ├─ handlePatchedBundle() force-loopback 时改写 client bundle
    ├─ handleRequest()     HTTP 反向代理
@@ -97,7 +106,7 @@ dsh web        127.0.0.1:3080（由守护进程托管）
 ### 认证设计
 
 - Cookie 名 `relay_session`，格式 `payload.signature`（base64url）
-- 签名：`HMAC-SHA256(HMAC-SHA256("dsh-relay", password), payload)`
+- 签名：`HMAC-SHA256(HMAC-SHA256("dsh-public-relay", password), payload)`
 - 校验用 `crypto.timingSafeEqual`，防时序侧信道
 - 登录失败固定延迟 400ms，拖慢暴力破解
 - Cookie 属性：`HttpOnly; SameSite=Lax; Path=/`
@@ -147,7 +156,7 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 > 现在的入口只有上面两个，端口信息直接显示在卡片/整页里。
 
 插件与独立脚本是两套实现，可以共存。完整的部署约束、排障与设计取舍见
-[`plugin/dsh-relay/README.md`](plugin/dsh-relay/README.md)。
+[`plugin/dsh-public-relay/README.md`](plugin/dsh-public-relay/README.md)。
 
 ### 两个关键部署点（否则看不到面板）
 
@@ -186,8 +195,9 @@ node plugin\tools\repair-patch-array.mjs <path-to-cordis.patch.yml>       # 顶�
 
 | 文件 | 说明 |
 | --- | --- |
-| `dsh-relay.js` | 独立脚本版主程序（守护进程 + 反向代理），零依赖 |
-| `plugin/` | 插件版（宿主半 + 浏览器半 + 安装/回滚 + 四套测试，合计 199 项断言） |
+| `dsh-public-relay.js` | 独立脚本版主程序（守护进程 + 反向代理），零依赖 |
+| `plugin/dsh-public-relay/` | 插件版（宿主半 + 浏览器半；npm 包本体） |
+| `plugin/tools/` · `plugin/tests/` | 15 个诊断/修复工具 + 四套测试（合计 222 项断言） |
 | `dsh-web.log` | dsh web 守护日志（运行时生成，已 gitignore） |
 | `_relay_out.log` / `_relay_err.log` | 启动重定向输出（运行时生成，已 gitignore） |
 
@@ -214,7 +224,7 @@ node plugin\tools\repair-patch-array.mjs <path-to-cordis.patch.yml>       # 顶�
 插件版已默认解决：它会按 dsh 的格式**代签会话 Cookie**，因此「打开隧道地址 → 只输中转口令 → 直接进入」。
 这条能力由 `autoSession` 控制（默认开，**口令为空时强制关闭**）。
 若仍要 `?token=`，看设置页状态区的「自动会话」指标 —— 它会直接说明是「口令为空被禁用」还是「读不到密钥」。
-细节与安全边界见 [`plugin/dsh-relay/README.md`](plugin/dsh-relay/README.md#自动管理-dsh-会话autosession)。
+细节与安全边界见 [`plugin/dsh-public-relay/README.md`](plugin/dsh-public-relay/README.md#自动管理-dsh-会话autosession)。
 
 **`install.ps1` 报语法错误（`The token '||' is not a valid statement separator` 等）**
 Windows PowerShell 5.1 按系统 ANSI 代码页读无 BOM 脚本，而本脚本是 UTF-8。保持该文件为
@@ -247,7 +257,7 @@ Windows PowerShell 5.1 按系统 ANSI 代码页读无 BOM 脚本，而本脚本�
 
 `<type>` 取值：`feat` 新功能 / `fix` 修 bug / `docs` 文档 / `refactor` 重构 / `test` 测试 / `chore` 杂项。
 
-约定：不主动 `git push`（本仓库暂无 remote）；改完先跑测试再提交；运行时产物（`*.log`、`.mimocode/`、`plugin/dsh-relay/node_modules/`）已在 `.gitignore` 里，不入库。
+约定：不主动 `git push`（本仓库暂无 remote）；改完先跑测试再提交；运行时产物（`*.log`、`.mimocode/`、`plugin/dsh-public-relay/node_modules/`）已在 `.gitignore` 里，不入库。
 
 ---
 

@@ -60,8 +60,8 @@ if (yaml) {
   try {
     const doc = parseWith(yaml, original);
     if (Array.isArray(doc)) {
-      const hasRelay = doc.some((e) => e && e.id === 'dsh-relay');
-      console.log(`[repair-patch-array] 文件已是合法数组（${doc.length} 项，含 dsh-relay=${hasRelay}），无需修复`);
+      const hasRelay = doc.some((e) => e && e.id === 'dsh-public-relay');
+      console.log(`[repair-patch-array] 文件已是合法数组（${doc.length} 项，含 dsh-public-relay=${hasRelay}），无需修复`);
       process.exit(0);
     }
   } catch {
@@ -99,8 +99,8 @@ if (yaml) {
   try {
     const doc = parseWith(yaml, fs.readFileSync(file, 'utf8'));
     if (!Array.isArray(doc)) throw new Error('顶层不是数组');
-    const hasRelay = doc.some((e) => e && e.id === 'dsh-relay');
-    console.log(`[repair-patch-array] 修复成功：数组 ${doc.length} 项，含 dsh-relay=${hasRelay}`);
+    const hasRelay = doc.some((e) => e && e.id === 'dsh-public-relay');
+    console.log(`[repair-patch-array] 修复成功：数组 ${doc.length} 项，含 dsh-public-relay=${hasRelay}`);
     process.exit(0);
   } catch (err) {
     console.error(`[repair-patch-array] 修复后仍无法解析（${String(err.message).split('\n')[0]}），已回滚`);

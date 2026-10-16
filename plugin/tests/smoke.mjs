@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * smoke.mjs — dsh-relay 插件验收测试（不依赖 dsh 运行）
+ * smoke.mjs — dsh-public-relay 插件验收测试（不依赖 dsh 运行）
  *
  * 直接拿 lib/relay.js 与一个 stub 上游 http server 对打，覆盖：
  *   Host/Origin 改写、口令认证全流程、cookie 验签、bundle 改写、
@@ -12,8 +12,8 @@
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createRelay } from '../dsh-relay/lib/relay.js';
-import { normalizeConfig, DEFAULTS } from '../dsh-relay/lib/config.js';
+import { createRelay } from '../dsh-public-relay/lib/relay.js';
+import { normalizeConfig, DEFAULTS } from '../dsh-public-relay/lib/config.js';
 
 // ── 整体超时保险 ──
 // 若测试因句柄挂起而无法推进，Node 会在无活动句柄时静默退出、退出码停在默认 0，
@@ -312,7 +312,7 @@ async function main() {
       const swap = await request(relayPort, '/?token=GOODTOKEN');
       const bodyText = swap.body.toString();
       check('无 cookie 的 ?token= 请求不被本插件拦下（不返回登录页）',
-        !bodyText.includes('dsh-relay 访问口令'),
+        !bodyText.includes('dsh-public-relay 访问口令'),
         `返回了登录页，正文前 80 字：${bodyText.slice(0, 80)}`);
       check('上游收到了该请求（status=302）', swap.status === 302, `got ${swap.status}`);
       const cookieHdr = swap.headers['set-cookie']?.[0] || '';
@@ -339,12 +339,12 @@ async function main() {
       // 不带 token 的裸 GET / 仍应是本插件的登录页（两层认证都在）
       const bare = await request(relayPort, '/');
       check('无 token 的裸访问仍是本插件登录页',
-        bare.status === 200 && bare.body.toString().includes('dsh-relay 访问口令'),
+        bare.status === 200 && bare.body.toString().includes('dsh-public-relay 访问口令'),
         `got ${bare.status}`);
     }
 
     // 伪造：自己用随机密钥签一个 payload
-    const fakeSecret = crypto.createHmac('sha256', 'dsh-relay').update('other-password').digest();
+    const fakeSecret = crypto.createHmac('sha256', 'dsh-public-relay').update('other-password').digest();
     const fakePayload = Buffer.from(JSON.stringify({ exp: Date.now() + 60000 })).toString('base64url');
     const fakeSig = crypto.createHmac('sha256', fakeSecret).update(fakePayload).digest('base64url');
     const forged = await request(relayPort, '/api/ping', {
