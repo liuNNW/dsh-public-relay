@@ -1,0 +1,27 @@
+# ───────── 依赖 ─────────
+node_modules/
+
+# ───────── AI 工具运行时目录 ─────────
+# .mimocode 是工具沙箱目录（自带 48MB node_modules / 3500+ 文件），不属于项目代码
+.mimocode/
+
+# ───────── 运行时日志（持续追加，不入库）─────────
+*.log
+# dsh-relay 守护日志：dsh-web.log
+# 启动重定向输出：_relay_out.log / _relay_err.log
+
+# ───────── 系统与编辑器杂物 ─────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp
+*.swp
+.vscode/
+.idea/
+
+# ───────── 快照与本地临时文件 ─────────
+*.pid
+*.bak
+
+# 本地开发用的模块解析链接（指向 dsh 的 node_modules，仅测试便利，不入库）
+plugin/dsh-relay/node_modules/

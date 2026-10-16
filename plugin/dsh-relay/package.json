@@ -1,0 +1,46 @@
+{
+  "name": "dsh-relay",
+  "version": "0.1.0",
+  "description": "DSH 中转插件：在本进程内反向代理 dsh 自身端口（Host/Origin 改写 + force-loopback + 口令认证 + WebSocket 透传），设置里显示当前 dsh 真实端口并随时启停。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./relay": "./lib/relay.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "relay",
+    "proxy",
+    "tunnel"
+  ],
+  "license": "MIT",
+  "dshTarget": "0.2.0-rc.2",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4"
+  }
+}
