@@ -8,7 +8,7 @@
  * 功能：
  *   1. 启动 dsh web 子进程并守护（崩溃自动重启，日志写入 dsh-web.log）
  *   2. 启动 HTTP 反向代理（Host/Origin 改写放行信任栅栏 + WebSocket upgrade）
- *   3. 默认口令 20040915 + --force-loopback（公网可看插件列表）
+ *   3. 默认 --force-loopback（公网可看插件列表）；口令留空时启动即随机生成并打印
  *
  * 零第三方依赖，仅用 Node 内置模块。
  */
@@ -43,7 +43,7 @@ dsh-public-relay — DSH Web 中转脚本（樱花映射 TCP 内网穿透）
   --host <ip>          中转监听地址（默认 127.0.0.1）
   --port <port>        中转监听端口（默认 3081；樱花映射隧道「本地端口」填这个值）
   --target <url>       上游 dsh web 地址（默认 http://127.0.0.1:3080）
-  --password <口令>    访问口令（默认 20040915；设为空字符串可关闭认证）
+  --password <口令>    访问口令（默认留空 → 启动时随机生成并打印；传空字符串可完全关闭认证）
   --no-watchdog        不启动 dsh web 守护（只跑中转，dsh web 需手动启动）
   --no-force-loopback  关闭强制回环（默认开启，关闭后公网看不到插件列表）
   --help               显示本帮助
@@ -67,7 +67,17 @@ function parseArgs(argv) {
     host: env.DSH_RELAY_HOST || DEFAULTS.host,
     port: env.DSH_RELAY_PORT || String(DEFAULTS.port),
     target: env.DSH_RELAY_TARGET || DEFAULTS.target,
-    password: '20040915',                     // 默认口令
+    /**
+     * 访问口令。
+     *
+     * 默认值刻意留空 → 首次启动时**自动生成一个随机口令并打印**。
+     *
+     * 为什么不再有硬编码默认口令：本仓库是公开的，任何写进源码的口令
+     * 都等于「全世界都知道的口令」。而中转的典型场景正是把 dsh 暴露到
+     * 公网 —— 一个已知口令等于没有口令。自动生成既保持了「装上就能用」，
+     * 又不把安全性赌在用户会去改它上面。
+     */
+    password: env.DSH_RELAY_PASSWORD || '',
     forceLoopback: true,                      // 默认开启
     watchdog: true,                           // 默认开启
   };
@@ -253,6 +263,25 @@ function makeAuth(password) {
 // ─────────────────────────── 主逻辑 ───────────────────────────
 
 const config = parseArgs(process.argv.slice(2));
+
+/**
+ * 没给口令时自动生成一个，而不是回落到某个写死在源码里的默认值 ——
+ * 本仓库是公开的，任何硬编码口令都等于「全世界都知道的口令」，而本工具的
+ * 典型场景正是把 dsh 暴露到公网。生成后打印到控制台，用户按提示保存复用。
+ *
+ * 「显式要求关闭认证」有两处入口，都尊重用户意图、不生成口令：
+ *   · `--password ''`（命令行显式传空）
+ *   · `DSH_RELAY_PASSWORD=''`（环境变量显式传空）
+ * 两者都意味着用户清楚自己在做什么（仅限本机 / 受信网络）。
+ */
+const passwordGivenExplicitly =
+  process.argv.includes('--password') || Object.hasOwn(process.env, 'DSH_RELAY_PASSWORD');
+let generatedPassword = null;
+if (config.password === '' && !passwordGivenExplicitly) {
+  generatedPassword = crypto.randomBytes(12).toString('base64url');
+  config.password = generatedPassword;
+}
+
 const TARGET = resolveTarget(config.target);
 const AUTH = config.password ? makeAuth(config.password) : null;
 const UPSTREAM = { hostname: TARGET.hostname, port: TARGET.port };
@@ -750,7 +779,12 @@ server.listen(config.port, config.host, () => {
     console.log(`dsh-public-relay: dsh web 守护已启动（崩溃自动重启，日志：dsh-web.log）`);
   }
   if (AUTH) {
-    console.log(`dsh-public-relay: 访问口令: ${config.password}`);
+    if (generatedPassword !== null) {
+      console.log(`dsh-public-relay: 访问口令（本次随机生成）: ${config.password}`);
+      console.log('dsh-public-relay: 记下它；下次用 --password 或 DSH_RELAY_PASSWORD 复用同一个口令');
+    } else {
+      console.log(`dsh-public-relay: 访问口令: ${config.password}`);
+    }
   }
   if (config.forceLoopback) {
     console.log('dsh-public-relay: 已启用 force-loopback（公网可看插件列表，Ctrl+F5 硬刷新生效）');

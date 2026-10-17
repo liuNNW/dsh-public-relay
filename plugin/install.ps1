@@ -89,8 +89,8 @@ function Invoke-Checks {
 
   # 5. 四套测试
   if (-not $SkipTests) {
-    Say '跑四套测试（中转核心 / 宿主半 / 浏览器半 / 会话代签）'
-    foreach ($t in @('smoke.mjs', 'host-integration.mjs', 'client-half.mjs', 'dsh-session.spec.mjs')) {
+    Say '跑五套测试（中转核心 / 宿主半 / 浏览器半 / 会话代签 / 口令模式）'
+    foreach ($t in @('smoke.mjs', 'host-integration.mjs', 'client-half.mjs', 'dsh-session.spec.mjs', 'password-modes.mjs')) {
       $tp = Join-Path $TestsDir $t
       if (-not (Test-Path $tp)) { Warn "找不到 $t，跳过"; continue }
       & node $tp *> $null

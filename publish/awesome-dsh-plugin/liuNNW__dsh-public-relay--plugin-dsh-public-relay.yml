@@ -2,5 +2,5 @@ url: https://github.com/liuNNW/dsh-public-relay/tree/main/plugin/dsh-public-rela
 name: liuNNW/dsh-public-relay#plugin
 category: remote
 description:
-  en: 'Reverse-proxies a local DeepSeek Harness web profile out through a tunnel: rewrites Host/Origin for the trust fence, patches the isLoopback check so plugin lists survive a public hostname, gates access with an HMAC-signed passcode cookie, signs the harness session cookie so the passcode alone signs you in, and passes WebSocket traffic through.'
-  zh: '把本机 DeepSeek Harness web 端口反向代理出去：改写 Host/Origin 过信任栅栏、改写 isLoopback 判定让公网之下插件列表仍可见、HMAC 签名口令 Cookie 控制访问、按宿主格式代签会话 Cookie（只输中转口令即可进入）、WebSocket 透传，让内网穿透能直接访问 dsh 界面。'
+  en: 'Reverse-proxies a local DeepSeek Harness web port out through a tunnel: rewrites Host/Origin for the trust fence, patches the client isLoopback check so plugin lists survive a public hostname, gates access with an HMAC-signed passcode cookie, signs the harness session cookie so the passcode alone signs you in, and passes WebSocket traffic through. Installs as a regular bundle and keeps its configuration in its own JSON file, so it does not depend on the host settings service.'
+  zh: '把本机 DeepSeek Harness 端口反向代理出去：改写 Host/Origin 过信任栅栏、改写客户端 isLoopback 判定让公网之下插件列表仍可见、HMAC 签名口令 Cookie 控制访问、按宿主格式代签会话 Cookie（只输中转口令即可进入）、WebSocket 透传，让内网穿透能直接访问 dsh 界面。按标准 bundle 安装，配置由自己的 JSON 文件持有，不依赖宿主的 settings 服务。'

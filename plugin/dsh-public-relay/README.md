@@ -77,7 +77,7 @@ dsh plugin --profile <profile> add dsh-public-relay
 ### 自检 / 清理
 
 ```powershell
-# 自检：manifest 兼容性 + 所有 lib/*.js 语法 + 四套测试（共 222 项断言）
+# 自检：manifest 兼容性 + 所有 lib/*.js 语法 + 五套测试（共 235 项断言）
 powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Check
 
 # 尝试用官方 CLI 安装
@@ -238,6 +238,7 @@ node plugin\tests\smoke.mjs              # 中转核心 63 项
 node plugin\tests\host-integration.mjs   # 宿主半 53 项
 node plugin\tests\client-half.mjs        # 浏览器半 62 项
 node plugin\tests\dsh-session.spec.mjs   # 会话代签 52 项
+node plugin\tests\password-modes.mjs     # 口令模式  5 项
 
 # 兼容性自检
 node plugin\tools\check-compat.mjs plugin\dsh-public-relay\package.json

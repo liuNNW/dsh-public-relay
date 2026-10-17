@@ -62,7 +62,7 @@ const ROW_LINES = [
   '        enabled: true',
   '        listenHost: "127.0.0.1"',
   '        listenPort: 3091',
-  '        password: "20040915"',
+  '        password: ""',
   '        forceLoopback: true',
 ];
 
