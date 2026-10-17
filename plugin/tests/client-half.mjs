@@ -376,7 +376,6 @@ async function main() {
   check('inject 只声明 slots（零外部服务依赖）',
     Array.isArray(exports.inject) && exports.inject.length === 1 && exports.inject[0] === 'slots',
     `got ${JSON.stringify(exports.inject)}`);
-
   // ── apply：座位注册 ──
   section('座位注册');
   const slotRegistrations = [];
@@ -416,20 +415,24 @@ async function main() {
   check('没有注册 shell.overlay（不在页面上挂悬浮元素）',
     !injects.some((i) => i.slotName === 'shell.overlay'),
     injects.map((i) => i.slotName).join(', '));
-  check('注册了 plugins.item（插件配置卡片）', injects.some((i) => i.slotName === 'plugins.item'),
+  check('注册了 plugins.row.config（插件行配置页）', injects.some((i) => i.slotName === 'plugins.row.config'),
     injects.map((i) => i.slotName).join(', '));
   check('注册了 settings.section', injects.some((i) => i.slotName === 'settings.section'),
     injects.map((i) => i.slotName).join(', '));
   check('register 调了两次', registers.length === 2, `got ${registers.length}`);
 
-  const itemReg = registers.find((r) => r.meta.name === 'plugins.item');
+  const rowReg = registers.find((r) => r.meta.name === 'plugins.row.config');
   const settingsReg = registers.find((r) => r.meta.name === 'settings.section');
-  check('plugins.item 元数据正确',
-    itemReg?.meta.id === 'dshPublicRelay' && typeof itemReg?.meta.order === 'number' && Boolean(itemReg?.meta.label),
-    JSON.stringify(itemReg?.meta));
+  // keyed 槽位用 key（`<包名>#<行 id>`），list 槽位用 id + order + label。
+  check('plugins.row.config 元数据正确',
+    rowReg?.meta.key === 'dsh-public-relay#dsh-public-relay',
+    JSON.stringify(rowReg?.meta));
   check('settings.section 元数据正确',
-    settingsReg?.meta.id === 'dshPublicRelay' && typeof settingsReg?.meta.order === 'number' && Boolean(settingsReg?.meta.label),
-    JSON.stringify(settingsReg?.meta));
+    settingsReg?.meta.id === 'dsh-public-relay'
+      && typeof settingsReg?.meta.order === 'number'
+      && typeof settingsReg?.meta.label === 'function'
+      && settingsReg.meta.label() === 'DSH 中转',
+    JSON.stringify({ ...settingsReg?.meta, label: String(settingsReg?.meta?.label) }));
 
   // ── 关键：座位的注入面必须为空 ──
   //
@@ -537,32 +540,26 @@ async function main() {
   check('设置页有「保存」按钮（自带表单）', settingsText.includes('保存'), settingsText.slice(-400));
   check('设置页展示了请求数与连接数', settingsText.includes('42') && settingsText.includes('3'), settingsText.slice(0, 400));
 
-  // ── plugins.item 配置卡片（用户要的主要入口）──
-  section('插件配置卡片（plugins.item）');
-  // summary 分支在组件体内判断，所以要渲染后才看得到结果
-  const summaryRender = fake.render(itemReg.component({ view: 'summary' }));
-  check('summary 视图渲染为一行说明（座位契约）',
-    typeof summaryRender.out === 'string' && summaryRender.out.length > 10,
-    JSON.stringify(summaryRender.out));
-
+  // ── plugins.row.config 配置页（插件行的「配置」入口）──
+  section('插件行配置页（plugins.row.config）');
   let cardRender = null;
   try {
-    const first = fake.render(itemReg.component(slotProps));
+    const first = fake.render(rowReg.component(slotProps));
     fake.runEffects(first.effects);
     await new Promise((r) => setTimeout(r, 30));
-    cardRender = fake.render(itemReg.component(slotProps));
+    cardRender = fake.render(rowReg.component(slotProps));
   } catch (err) {
-    check('插件配置卡片渲染不抛错', false, err.stack || err.message);
+    check('插件行配置页渲染不抛错', false, err.stack || err.message);
   }
-  check('插件配置卡片渲染不抛错', Boolean(cardRender));
+  check('插件行配置页渲染不抛错', Boolean(cardRender));
   const cardText = cardRender ? textOf(cardRender.out).join(' | ') : '';
-  check('卡片含「中转监听端口」字段', cardText.includes('中转监听端口'), cardText.slice(0, 600));
-  check('卡片含「访问口令」字段', cardText.includes('访问口令'), cardText.slice(0, 600));
-  check('卡片含「强制回环改写」字段', cardText.includes('强制回环改写'), cardText.slice(0, 600));
-  check('卡片含「启用中转」字段', cardText.includes('启用中转'), cardText.slice(0, 600));
-  check('卡片含「自动管理 dsh 会话」字段', cardText.includes('自动管理 dsh 会话'), cardText.slice(0, 800));
-  check('卡片含自动会话的说明文案', cardText.includes('只输中转口令'), cardText.slice(0, 1200));
-  check('卡片也显示当前 dsh 端口', cardText.includes('3080'), cardText.slice(0, 400));
+  check('配置页含「中转监听端口」字段', cardText.includes('中转监听端口'), cardText.slice(0, 600));
+  check('配置页含「访问口令」字段', cardText.includes('访问口令'), cardText.slice(0, 600));
+  check('配置页含「强制回环改写」字段', cardText.includes('强制回环改写'), cardText.slice(0, 600));
+  check('配置页含「启用中转」字段', cardText.includes('启用中转'), cardText.slice(0, 600));
+  check('配置页含「自动管理 dsh 会话」字段', cardText.includes('自动管理 dsh 会话'), cardText.slice(0, 800));
+  check('配置页含自动会话的说明文案', cardText.includes('只输中转口令'), cardText.slice(0, 1200));
+  check('配置页也显示当前 dsh 端口', cardText.includes('3080'), cardText.slice(0, 400));
   check('状态区显示「自动会话」指标', cardText.includes('自动会话'), cardText.slice(0, 600));
 
   // ── 自动会话的三种状态必须一眼可分 ──

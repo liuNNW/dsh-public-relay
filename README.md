@@ -135,46 +135,59 @@ dsh web        127.0.0.1:3080（由守护进程托管）
 同一个中转能力已经做成 **常驻 DSH 插件**，跑在 dsh 进程内，并能在设置页直接看到
 **当前 dsh 的真实端口**、随时开关。
 
+**0.2.0 起按标准 bundle 通道安装**，不再手改 profile 的 `cordis.patch.yml`：
+
 ```powershell
-# 安装（默认 desktop profile；任何一步失败自动回滚）
-powershell -ExecutionPolicy Bypass -File plugin\install.ps1
+# 自检（manifest 兼容性 + 语法 + 四套测试，共 222 项断言）
+powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Check
 
-# 装到 web profile
-powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Profile web
+# 用官方 CLI 装
+powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Install
 
-# 回滚
+# 清理「早期手工安装方式」的残留（旧 patch 条目 / node_modules 副本）
 powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 ```
 
+未发布到 npm 时，用 dsh 的 `plugin_manager`（`install_bundle`）指向
+`plugin/dsh-public-relay` 目录即可；GUI 里是「设置 → 插件 → 安装本地插件」。
+
 装完**完全退出 dsh 再打开**（含系统托盘；Electron 关窗口不杀进程），然后：
 
-1. **设置 → 插件 → 「DSH 中转」**：配置卡片，与「MiMo 视觉识别」同一位置同一形态。
-   在这里改启用开关、监听地址/端口、访问口令、force-loopback
-2. **设置 → 「DSH 中转」**：同一份配置的独立整页，另附端口信息与启停按钮
+1. **设置 → 「DSH 中转」**：独立整页，端口信息 + 启停 + 完整表单（主入口）
+2. **设置 → 插件 → DSH 中转 → 配置**：同一份配置的行级配置页
 
 > 早期版本还有一个左下角悬浮角标，它压在侧栏「设置」按钮上导致设置点不开，已移除。
-> 现在的入口只有上面两个，端口信息直接显示在卡片/整页里。
+> 现在的入口只有上面两个。
+
+配置由插件自己的 JSON 文件持有（`$DSH_HOME/profiles/<profile>/dsh-public-relay.json`），
+与 dsh 版本、schemastery 版本、settings 服务是否存在全部解耦。
 
 插件与独立脚本是两套实现，可以共存。完整的部署约束、排障与设计取舍见
 [`plugin/dsh-public-relay/README.md`](plugin/dsh-public-relay/README.md)。
 
-### 两个关键部署点（否则看不到面板）
+### 为什么 0.2.0 换掉了「两个关键部署点」
 
-**一、装到 profile 本地 `node_modules`，而不是共享目录。**
-配置卡片依赖 schemastery 的 `.volatile()`（把字段投进设置表单），该方法只在 **3.18.4+** 存在：
-共享目录 `profiles/node_modules` 是 3.18.1（没有），`profiles/desktop/node_modules` 是 3.18.4（有）。
-安装在 profile 本地才会就近解析到正确版本。
+早期版本必须满足两条约束才看得见面板，现在**两条都不再需要**：
 
-**二、用 `cordis.patch.yml` 条目，而不是 `dsh.profile.bundles`。**
-Electron 版 dsh 独占管理 desktop profile（其 CLI 直接拒绝 `--profile desktop --dump-config`，
-报 `managed exclusively by the Electron application`），bundle 层的自动 insert 对它不生效。
-实测只写 bundles 时，宿主里既没有插件的配置项、也没有它注册的工具，设置页自然看不到卡片。
+| 旧约束 | 为什么当时成立 | 0.2.0 为什么不需要 |
+| --- | --- | --- |
+| 装到 profile 本地 `node_modules` | 依赖 schemastery 的 `.volatile()`（≥3.18.4） | 配置改由插件自己的 JSON 文件持有，不用 schemastery |
+| 用 `cordis.patch.yml` 条目而非 `dsh.profile.bundles` | bundle 层自动 insert 当时对 desktop profile 不生效 | 已实测：`install_bundle` 走 bundle 通道能在 desktop profile 上正常挂载并 `fiberPhase: active` |
 
-诊断命令：
+> 注意两条约束的**残留**：旧版手工装法写入的 `- insert:` 条目必须清掉，否则
+> 同一个 id 会被插入两次、Loader 报重复 id。用
+> `powershell -File plugin\install.ps1 -Revert` 清理。
+
+兼容性自检（最容易踩、症状最隐蔽的坑：判 `incompatible-version` 后 rows 为空，
+插件完全静默不加载）：
 
 ```powershell
-node plugin\tools\diagnose.mjs
+node plugin\tools\check-compat.mjs plugin\dsh-public-relay\package.json
 ```
+
+判据已从 dsh 0.2.1-rc.2 源码逐行核实：有 `engines.dsh` 时它**单独决定**结论；
+没有时只校验名字形如 `@deepseek-ai/dsh-*` 的 peer（`peerDependenciesMeta.optional`
+**不能**豁免）；两者都不声明则恒通过。本插件属最后一种。
 
 ### 插件顺带修的问题：`dsh web` 起不来
 

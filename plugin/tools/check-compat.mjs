@@ -4,31 +4,40 @@
  *
  * ── 为什么需要这个检查 ──
  *
- * dsh 的插件管理器会校验插件 package.json 里的 peerDependencies 与 dshTarget。
+ * dsh 的插件管理器在装载/启用 bundle 前会跑
+ * `evaluatePluginCompatibility(manifest, exemptions, runtimeVersion)`。
  * 一旦不匹配，它返回：
  *
- *   "error": { "code": "incompatible-version",
- *              "incompatible": [{ "name": "...", "peers": {...} }] }
+ *   { "code": "incompatible-version",
+ *     "incompatible": [{ "name", "version", "runtimeVersion", "requirements" }] }
  *   "rows": []        ← 空！插件完全不会被加载
  *
- * 此时的症状极具误导性：dsh 能正常启动、启动日志不报错、插件文件也都在，
+ * 症状极具误导性：dsh 能正常启动、启动日志不报错、插件文件也都在，
  * 但 UI 上**哪里都看不到这个插件**，重启多少次都没用。
  *
- * 最容易踩的写法：把 dsh 自带包（如 @deepseek-ai/dsh-tools）声成
- * "^0.1.0-rc.6" —— semver 的 ^ 对 0.x 预发布版本不匹配同系列的 rc.8，
- * 于是整包被拒。
+ * ── 判据（已从 0.2.1-rc.2 源码逐行核实，不是推测）──
  *
- * ── 判据（与 @deepseek-ai/dsh-mimo-vision 对齐）──
- *   · peerDependencies 只声明 @deepseek-ai/cordis（用 ~ 固定次版本）
- *   · dshTarget 与运行时主版本一致
- *   · 其余 dsh 自带包一律不写进 peerDependencies，改为运行期 ctx.get() 软获取
+ * `dsh-app-boot` 的 `unmetRequirements()`：
+ *
+ *   ① 有 `engines.dsh` → **只看它**，peerDependencies 整个被忽略；
+ *      范围为空串 / `workspace:` 一律判不满足。
+ *   ② 没有 `engines.dsh` → 逐个检查 peerDependencies 里**名字符合
+ *      `@deepseek-ai/dsh` 或 `@deepseek-ai/dsh-*`** 的项；其余（cordis、
+ *      schemastery、react…）根本不看。
+ *   ③ `peerDependenciesMeta.optional` **完全不参与判定** —— 标了 optional 的
+ *      dsh-* peer 依然会被强制校验。这是最容易踩的一条。
+ *   ④ 两者都不声明 → 恒通过（数学上的保证）。
+ *   ⑤ 范围比较用 `semver.satisfies(runtime, range, { includePrerelease: true })`，
+ *      所以 `^0.2.0` 能匹配 `0.2.1-rc.2`（普通 npm 语义下不行）。
+ *
+ * `dshTarget` 是**本仓库早期自造的字段，dsh 从不读取**（全量 grep 零命中），
+ * 已废弃；本检查会把它报为「无害但无意义」。
  *
  * 用法：node check-compat.mjs <package.json>
  * 退出码 0 = 通过
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { createRequire } from 'node:module';
 
 const target = process.argv[2];
@@ -47,9 +56,10 @@ const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
 const pluginDir = path.dirname(file);
 
 const problems = [];
+const warnings = [];
 const notes = [];
 
-/** 解析 dsh 运行时里某个包的真实版本（以插件自身为锚点，与运行时一致）。 */
+/** 解析运行时里某个包的真实版本（以插件自身为锚点）。 */
 function installedVersion(name) {
   try {
     const req = createRequire(path.join(pluginDir, 'package.json'));
@@ -61,124 +71,180 @@ function installedVersion(name) {
   return null;
 }
 
-/** 极简 semver 范围匹配：覆盖本场景用到的写法（~x.y.z、^x.y.z、精确、*）。 */
+/**
+ * 读取运行时版本。
+ *
+ * 注意 `@deepseek-ai/dsh`（无后缀）不是运行时版本来源：共享目录里可能还留着
+ * 0.1.0-rc.8 的老副本，读它会得出错误结论。真正可信的来源，按优先级：
+ *   1. `@deepseek-ai/dsh-app-boot` —— 兼容性检查本身就是它做的，版本即运行时
+ *   2. 环境变量 `DSH_RUNTIME_VERSION`（给 CI / 显式覆盖用）
+ *   3. 读不到 → null，比对时跳过并提示
+ */
+function runtimeVersion() {
+  const fromEnv = process.env.DSH_RUNTIME_VERSION;
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv.trim();
+  return installedVersion('@deepseek-ai/dsh-app-boot') || null;
+}
+
+/**
+ * semver 范围匹配，**对齐 dsh 的 includePrerelease: true 语义**。
+ *
+ * 覆盖本场景用到的写法：^x.y.z / ~x.y.z / 精确 / >=x.y.z / * 。
+ * 判错方向很重要：本检查用于拦截「会导致整包被拒」的写法，
+ * 所以不确定时应当报警而不是放行。
+ */
 function satisfies(version, range) {
-  if (!version || !range || range === '*' || range === '') return true;
-  const r = String(range).trim();
-  const v = String(version).trim();
+  if (!version) return { ok: true, reason: '运行时版本未知，跳过比对' };
+  if (!range || range === '' ) return { ok: false, reason: '空范围恒不满足' };
+  if (range === '*') return { ok: true, reason: '*' };
+
+  if (range.startsWith('workspace:')) return { ok: false, reason: 'workspace: 在 engines.dsh 里恒不满足' };
 
   const parse = (s) => {
-    const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/.exec(s);
+    const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/.exec(String(s).trim());
     if (!m) return null;
     return { major: +m[1], minor: +m[2], patch: +m[3], pre: m[4] || null };
   };
-  const a = parse(v);
-  const b = parse(r);
-  if (!a || !b) return false;
+  const a = parse(version);
+  if (!a) return { ok: false, reason: `无法解析运行时版本 ${version}` };
 
-  // 精确版本（含预发布）
-  if (/^\d/.test(r) && !r.startsWith('^') && !r.startsWith('~')) {
-    const eq = (x, y) => x.major === y.major && x.minor === y.minor && x.patch === y.patch && (x.pre || '') === (y.pre || '');
-    return eq(a, b);
+  // >=x.y.z
+  if (range.startsWith('>=')) {
+    const b = parse(range.slice(2));
+    if (!b) return { ok: false, reason: `无法解析范围 ${range}` };
+    const cmp = (a.major - b.major) || (a.minor - b.minor) || (a.patch - b.patch);
+    if (cmp > 0) return { ok: true, reason: `>= ${range.slice(2)}` };
+    if (cmp < 0) return { ok: false, reason: `低于 >= ${range.slice(2)}` };
+    // 同 base：includePrerelease 下，带 pre 的运行时仍满足（dsh 的判定就是如此）
+    return { ok: true, reason: `>= ${range.slice(2)}（同 base）` };
   }
 
-  const op = r[0];
-  if (op === '~') {
+  const b = parse(range.startsWith('^') || range.startsWith('~') ? range.slice(1) : range);
+  if (!b) return { ok: false, reason: `无法解析范围 ${range}` };
+
+  const exact = !range.startsWith('^') && !range.startsWith('~');
+  const eqBase = (x, y) => x.major === y.major && x.minor === y.minor && x.patch === y.patch;
+
+  if (exact) {
+    return eqBase(a, b) && (a.pre || '') === (b.pre || '')
+      ? { ok: true, reason: '精确匹配' }
+      : { ok: false, reason: '精确版本不相等' };
+  }
+
+  if (range.startsWith('~')) {
     // ~x.y.z → 同 major.minor，patch >= z
-    if (a.major !== b.major || a.minor !== b.minor) return false;
-    if (a.patch < b.patch) return false;
-    // 预发布：同 base 时要求 pre 版本 >= 声明；不同则保守判不匹配
-    if (b.pre && !a.pre) return false;
-    return true;
+    if (a.major !== b.major || a.minor !== b.minor) return { ok: false, reason: '~ 要求同 major.minor' };
+    if (a.patch < b.patch) return { ok: false, reason: '~ 要求 patch 不小于声明值' };
+    return { ok: true, reason: '~ 匹配' };
   }
-  if (op === '^') {
-    if (b.major > 0) {
-      // ^x.y.z → 同 major，>= x.y.z
-      if (a.major !== b.major) return false;
-      if (a.minor < b.minor) return false;
-      if (a.minor === b.minor && a.patch < b.patch) return false;
-      return true;
+
+  // ^x.y.z
+  if (b.major > 0) {
+    if (a.major !== b.major) return { ok: false, reason: '^ 要求同 major' };
+    if (a.minor < b.minor) return { ok: false, reason: '^ 要求 minor 不小于声明值' };
+    if (a.minor === b.minor && a.patch < b.patch) return { ok: false, reason: '^ 要求 patch 不小于声明值' };
+    return { ok: true, reason: '^ 匹配（includePrerelease）' };
+  }
+  // ^0.y.z：0.x 语义 —— 同 major.minor。注意 includePrerelease 让 ^0.2.0 也能匹配 0.2.1-rc.2
+  if (a.major !== 0) return { ok: false, reason: '^0.y.z 只匹配 0.x' };
+  if (a.minor !== b.minor) return { ok: false, reason: '^0.y.z 要求同 minor' };
+  if (a.patch < b.patch) return { ok: false, reason: '^0.y.z 要求 patch 不小于声明值' };
+  return { ok: true, reason: '^0.y.z 匹配（includePrerelease）' };
+}
+
+const runtime = runtimeVersion();
+notes.push(runtime === null ? '运行时版本：未解析到（跳过范围比对）' : `运行时 dsh 版本：${runtime}`);
+
+// ── 1. engines.dsh（存在时完全决定结果）──
+const engines = pkg.engines || {};
+if (Object.hasOwn(engines, 'dsh')) {
+  if (typeof engines.dsh !== 'string') {
+    problems.push('engines.dsh 必须是字符串（非字符串会让兼容性检查抛错，等于整包被拒）');
+  } else {
+    const r = satisfies(runtime, engines.dsh);
+    if (r.ok) {
+      notes.push(`engines.dsh: ${engines.dsh} ✓（${r.reason}；存在时 peerDependencies 被完全忽略）`);
+    } else {
+      problems.push(
+        `engines.dsh: ${engines.dsh} 不满足 —— ${r.reason}。`
+        + `有 engines.dsh 时它**单独决定**结论，peerDependencies 不参与。`,
+      );
     }
-    // ^0.y.z → 只允许同 major.minor（这是 rc 系列踩坑的地方）
-    if (a.major !== 0 || b.major !== 0) return false;
-    if (a.minor !== b.minor) return false;
-    if (a.patch < b.patch) return false;
-    // 同一 minor 下：声明了预发布时，运行版若不是预发布 → 视为匹配（正式版更新）
-    return true;
   }
-  // 不支持其它写法，保守通过（避免误报阻断安装）
-  notes.push(`无法判定的范围写法：${range}`);
-  return true;
-}
-
-// ── 1. peerDependencies ──
-//
-// 只把「dsh 自带包写进 peers」当成致命问题。实测依据：
-//   · @deepseek-ai/dsh-mimo-vision 声明 "@deepseek-ai/cordis": "~4.0.4"，
-//     而运行时是 4.0.1 —— 同样不匹配，但它能正常加载。
-//   所以 cordis 这条 dsh 并不校验，不能据此报错，否则会误导排查方向。
-//   真正致命的是 dsh 自带能力包（dsh-tools / typert-protocol 等）出现在 peers 里：
-//   插件管理器会拿它们跟运行时版本比对，rc 系列用 ^ 极易不匹配，
-//   一旦不匹配就 incompatible-version、rows 为空、UI 上彻底看不到插件。
-const peers = pkg.peerDependencies || {};
-const peersMeta = pkg.peerDependenciesMeta || {};
-const ALLOWED_PEER_PREFIX = '@deepseek-ai/cordis';
-
-/** 该 peer 是否被标成 optional。 */
-const isOptionalPeer = (name) => peersMeta[name]?.optional === true;
-
-for (const [name, range] of Object.entries(peers)) {
-  const actual = installedVersion(name);
-
-  // `optional: true` 的 peer 是安全写法 —— 已发布并在市场里的
-  // @deepseek-ai/dsh-mimo-vision 与 dsh-plugin-wallpaper-engine 都用它把
-  // dsh 自带能力包声明进来。optional 的含义是「宿主没提供也不报错」，
-  // 插件管理器不会拿它做 incompatible-version 判定，因此不该判失败。
-  if (isOptionalPeer(name)) {
-    if (actual === null) notes.push(`${name}@${range}（optional；解析路径内未找到运行时版本，跳过比对）`);
-    else notes.push(`${name}@${range} ↔ 运行时 ${actual}（optional，不参与版本拒绝）`);
-    continue;
+  // 有 engines.dsh 时 peers 不参与判定，但仍提示畸形类型（会抛错）
+  for (const [name, range] of Object.entries(pkg.peerDependencies || {})) {
+    if (typeof range !== 'string') problems.push(`peerDependencies[${JSON.stringify(name)}] 必须是字符串（非字符串会抛错）`);
   }
-
-  if (!name.startsWith(ALLOWED_PEER_PREFIX)) {
-    problems.push(
-      `peerDependencies 声明了**非 optional** 的 ${name}@${range}：dsh 自带能力包必须标 optional，`
-      + `否则插件管理器会校验它与运行时版本，不匹配就整包拒绝`
-      + `（症状：dsh 启动正常但 UI 里完全没有这个插件）。`
-      + `加进 peerDependenciesMeta 标 optional: true，或改为运行期 ctx.get('<服务名>') 软获取。`,
-    );
-    continue;
-  }
-
-  // 允许的 peer：只提示，不判失败
-  if (actual === null) notes.push(`${name}@${range}（解析路径内未找到运行时版本，跳过比对）`);
-  else notes.push(`${name}@${range} ↔ 运行时 ${actual}（dsh 不校验此条，仅供参考）`);
-}
-
-// ── 2. dshTarget ──
-const target2 = pkg.dshTarget;
-if (!target2) {
-  problems.push('缺少 dshTarget：与 MiMo 对齐应声明 dshTarget（如 "0.2.0-rc.2"）');
 } else {
-  notes.push(`dshTarget: ${target2}`);
+  // ── 2. peerDependencies 里只有 dsh-* 会被检查 ──
+  const peers = pkg.peerDependencies || {};
+  if (Object.keys(peers).length === 0) {
+    notes.push('既无 engines.dsh 也无 peerDependencies → 恒通过兼容性检查 ✓');
+  }
+
+  for (const [name, range] of Object.entries(peers)) {
+    if (typeof range !== 'string') {
+      problems.push(`peerDependencies[${JSON.stringify(name)}] 必须是字符串（非字符串会抛错）`);
+      continue;
+    }
+    const checked = name === '@deepseek-ai/dsh' || name.startsWith('@deepseek-ai/dsh-');
+    if (!checked) {
+      notes.push(`${name}@${range}（dsh 不校验这类 peer，仅供参考）`);
+      continue;
+    }
+    const optional = pkg.peerDependenciesMeta?.[name]?.optional === true;
+    const r = satisfies(runtime, range);
+    if (r.ok) {
+      notes.push(`${name}@${range} ✓（${r.reason}${optional ? '；标了 optional 但 dsh 照样校验' : ''}）`);
+    } else {
+      problems.push(
+        `${name}@${range} 不满足 —— ${r.reason}。`
+        + `dsh 会据此判 incompatible-version 并整包拒绝加载`
+        + `${optional ? '；注意 peerDependenciesMeta.optional **不能**豁免这条检查' : ''}。`,
+      );
+    }
+  }
 }
 
 // ── 3. 结构完整性 ──
-if (!pkg.dsh?.bundle?.patch) problems.push('缺少 dsh.bundle.patch → bundles 机制无法装载');
-else if (!fs.existsSync(path.join(pluginDir, pkg.dsh.bundle.patch))) {
-  problems.push(`dsh.bundle.patch 指向的 ${pkg.dsh.bundle.patch} 不存在`);
+if (!pkg.dsh?.bundle?.patch) {
+  problems.push('缺少 dsh.bundle.patch → bundle 机制无法装载（manager 报 not-bundle）');
 } else {
-  notes.push(`dsh.bundle.patch: ${pkg.dsh.bundle.patch} ✓`);
+  const patchPath = path.join(pluginDir, pkg.dsh.bundle.patch);
+  if (!fs.existsSync(patchPath)) problems.push(`dsh.bundle.patch 指向的 ${pkg.dsh.bundle.patch} 不存在`);
+  else notes.push(`dsh.bundle.patch: ${pkg.dsh.bundle.patch} ✓`);
 }
 
-if (!pkg.dsh?.client?.platform) problems.push('缺少 dsh.client.platform → 浏览器半不会被加载');
-else notes.push(`dsh.client.platform: ${pkg.dsh.client.platform} ✓`);
+if (pkg.dsh?.client && !pkg.dsh.client.platform) {
+  problems.push('有 dsh.client 但缺 platform → 浏览器半不会被加载（platform 必须是 "web"）');
+} else if (pkg.dsh?.client?.platform && pkg.dsh.client.platform !== 'web') {
+  problems.push(`dsh.client.platform = ${JSON.stringify(pkg.dsh.client.platform)}；当前只支持 "web"`);
+} else if (pkg.dsh?.client?.platform === 'web') {
+  const clientExport = typeof pkg.exports === 'object' ? pkg.exports['./client'] : undefined;
+  if (!clientExport) problems.push('声明了 dsh.client 但 exports 里没有 "./client" → 组合期抛错');
+  else notes.push('exports["./client"] ✓');
+  const external = pkg.dsh.client.external;
+  if (Array.isArray(external) && external.length > 0) {
+    warnings.push(`dsh.client.external = ${JSON.stringify(external)}：可用的只有外壳冻结的模块表`
+      + `（react / react-dom / @deepseek-ai/dsh-client-ui-primitives 等）；其余请求必须由另一个 client 包提供`);
+  }
+}
+
+// ── 4. 已废弃字段 ──
+if (Object.hasOwn(pkg, 'dshTarget')) {
+  warnings.push('dshTarget 是早期自造字段，dsh 从不读取（0.2.1-rc.2 全量 grep 零命中），可以删掉');
+}
+if (Object.hasOwn(pkg.dsh || {}, 'manifestVersion') && typeof pkg.dsh.manifestVersion !== 'number') {
+  warnings.push('dsh.manifestVersion 只作文档用途，非数字即可；dsh 不校验它');
+}
 
 if (pkg.type !== 'module') notes.push('提示：type 建议为 "module"（ESM）');
 
 // ── 输出 ──
-console.log(`[check-compat] ${path.basename(pluginDir)}@${pkg.version || '?'}`);
+console.log(`[check-compat] ${pkg.name || path.basename(pluginDir)}@${pkg.version || '?'}`);
 for (const n of notes) console.log(`  · ${n}`);
+for (const w of warnings) console.log(`  ! ${w}`);
+
 if (problems.length > 0) {
   console.error(`[check-compat] 发现 ${problems.length} 个会导致「插件不加载」的问题：`);
   for (const p of problems) console.error(`  ✗ ${p}`);

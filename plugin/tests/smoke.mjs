@@ -12,7 +12,7 @@
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createRelay } from '../dsh-public-relay/lib/relay.js';
+import { createRelay, patchIsLoopback } from '../dsh-public-relay/lib/relay.js';
 import { normalizeConfig, DEFAULTS } from '../dsh-public-relay/lib/config.js';
 
 // ── 整体超时保险 ──
@@ -200,6 +200,41 @@ function startUpstream() {
 // ═══════════════════════════ 主流程 ═══════════════════════════
 
 async function main() {
+  // ═══ isLoopback 结构化改写（不依赖「候选正则命中」）═══
+  //
+  // 0.1.x 时代用三条候选正则匹配 dsh 的原文。dsh 一改写法（0.2.x 在判据前面
+  // 又加了 `transport?.ownsHost === true ||`）正则就失配，特征还是静默的：
+  // 日志里只有一句「未找到目标模式」，公网侧插件列表悄悄变空。
+  // 现在改成「找键名 → 按括号深度取整个值表达式 → 整段替换」，与写法无关。
+  section('isLoopback 结构化改写');
+  {
+    const currentShape = 'const h = { api, isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname), generation: 1 };';
+    const r1 = patchIsLoopback(currentShape);
+    check('0.2.x 写法（含 transport?.ownsHost）被命中', r1.hits === 1, `hits=${r1.hits}`);
+    check('改写后值是裸 true', r1.body.includes('isLoopback: true'), r1.body.slice(0, 160));
+    check('后续字段未被吞掉', r1.body.includes('generation: 1'), r1.body.slice(0, 160));
+
+    const oldShape = 'const h = {\n  isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),\n  hostDescription: {},\n};';
+    const r2 = patchIsLoopback(oldShape);
+    check('0.1.x 写法也被命中', r2.hits === 1 && r2.body.includes('isLoopback: true'), r2.body);
+    check('多行形态下后续字段保留', r2.body.includes('hostDescription: {}'), r2.body);
+
+    // 不能误改：字段名只是前缀相同、或压根没有这个字段
+    const noHit1 = patchIsLoopback('const foo = { isLoopbacking: 1 };');
+    check('字段名只是前缀相同时不改', noHit1.hits === 0 && noHit1.body.includes('isLoopbacking: 1'), noHit1.body);
+    const noHit2 = patchIsLoopback('function f(){ return 1 }');
+    check('没有该字段时不改', noHit2.hits === 0 && noHit2.body === 'function f(){ return 1 }', noHit2.body);
+    // 值表达式里既没有 isLoopback 也没有 ownsHost/pageLocation → 不是我们要改的
+    const noHit3 = patchIsLoopback('const h = { isLoopback: true };');
+    check('值里没有相关标识符时不改（防误伤）', noHit3.hits === 0, noHit3.body);
+
+    // 字符串里的同名文本不能被当成代码改
+    const inString = 'const s = "isLoopback: pageLocation"; const h = { isLoopback: pageLocation === void 0 };';
+    const r3 = patchIsLoopback(inString);
+    check('字符串字面量里的同名文本不被改写',
+      r3.body.includes('"isLoopback: pageLocation"'), r3.body);
+  }
+
   section('配置归一化');
   {
     const c = normalizeConfig({

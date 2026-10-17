@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DSH Relay (public access)",
+    "description": "Reverse-proxies the local dsh port to the public internet: trust-fence header rewriting, forced loopback, passcode auth, signed session cookies, WebSocket passthrough."
+  }
+}

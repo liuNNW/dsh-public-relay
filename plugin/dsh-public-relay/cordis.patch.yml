@@ -1,11 +1,25 @@
-# dsh-public-relay bundle patch 层。
+# dsh-public-relay bundle patch
 #
-# 由 package.json 的 dsh.bundle.patch 声明引用；把本包列进 profile 的
-# dsh.profile.bundles 时，这一层负责插入插件行。
+# 本文件是 npm 包里 `dsh.bundle.patch` 指向的补丁层。通过官方渠道安装时：
 #
-# 注意：如果改用 profile 自己的 cordis.patch.yml 手写 insert，
-# 就不要再把本包列入 dsh.profile.bundles —— 两条路径同时用会让
-# id `dsh-public-relay` 被插入两次（Loader 会按重复 id 报冲突）。
+#   dsh plugin --profile <name> add dsh-public-relay
+#
+# 或（本仓库/本地目录安装）由 plugin_manager 的 install_bundle 处理。
+# 命令会把 `dsh-public-relay` 追加进 profile 的 `dsh.profile.bundles`，
+# profile 启动时合并本补丁（一条 insert）——**不需要手改
+# profile 自己的 cordis.patch.yml**。
+#
+# ⚠ 如果 profile 的 cordis.patch.yml 里还留着旧版本手工写的
+#   `- insert: [{ id: dsh-public-relay, name: dsh-public-relay }]`，
+#   请先删掉它，否则同一个 id 会被插入两次，Loader 会按重复 id 报冲突。
+#   仓库里的 `plugin/tools/clean-relay-rows.mjs` 就是干这件事的。
+#
+# 聚合包（aggregate bundle）可能用自己的 id 挂载同一个包。两条挂载会重复
+# 注册同一条 HTTP 前缀路由（webserver 对重复 (kind, path) 直接抛错），
+# 下面这条 `!!js` 表达式在「已有另一个启用中的同名条目」时让本行退让：
+# Loader 处理本行时只能看到排在它前面的条目，所以聚合包必须排在前面
+# （`dsh plugin add` 总是追加到末尾，正好符合）。
 - insert:
     - id: dsh-public-relay
       name: dsh-public-relay
+      disabled: !!js "[...ctx.loader.entries()].some((e) => e.options.name === 'dsh-public-relay' && e.options.id !== 'dsh-public-relay' && !e.disabled)"

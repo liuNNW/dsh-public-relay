@@ -1,15 +1,26 @@
 /**
  * relay.js — DSH 中转核心（纯库，无进程副作用）
  *
- * 移植自工作区根的 dsh-public-relay.js，改动集中在四处「独立进程假设」：
- *   1. 删除 process.exit() / fail() / 打印 HELP —— 改抛异常或记入 lastError；
- *   2. 删除整个 dsh web watchdog（startDshWeb/stopDshWeb/快速崩溃/心跳/SIGINT）——
- *      插件就跑在 dsh 进程内，没有子进程可守，宿主本身不会退出；
- *   3. EADDRINUSE 不再退出，记 lastError='port-in-use' 并保持 stopped，交给 UI；
- *   4. 上游 target 惰性求值（默认取本进程 webServer 的真实端口），不再写死 3080。
+ * 职责：在本进程内起一个 HTTP + WebSocket 反向代理，把本机 dsh 的端口
+ * 转发到隧道/公网入口，并处理四件 dsh 自身不负责的事：
  *
- * 另外 stop() 真正释放端口：server.close() 只停止接受新连接，
- * keep-alive 连接与已升级的 WebSocket 会让端口继续挂着，必须逐个 destroy。
+ *   1. **过信任栅栏**：把 Host/Origin 改写成上游回环权威；
+ *   2. **口令认证**：HMAC-SHA256 签名 Cookie 的会话口令（可选）；
+ *   3. **代签 dsh 会话 Cookie**：让用户只输中转口令就能进（可选）；
+ *   4. **强制回环改写**：把客户端 bundle 里的 `isLoopback` 判定改成恒真（可选）。
+ *
+ * 0.2.0 相对 0.1.x 的实质改动：
+ *
+ *   · `isLoopback` 改写不再依赖「候选正则命中」，改成**结构性扫描**：
+ *     找到 `isLoopback:` 这个键，再按括号深度找出它后面的整个值表达式，
+ *     整段替换成 `true`。dsh 换写法（新增 `transport?.ownsHost`、
+ *     改名局部变量、压缩/未压缩差异）都不会让改写失效。
+ *   · 命中范围从「某个固定文件路径」改成「任何 content-type 是 JavaScript
+ *     的 /plugins/ 响应」——0.2.x 的客户端 bundle 走 combo URL
+ *     （/plugins/??a/client.js,b/client.js&rev=…），单资源路径不再是唯一形态。
+ *   · 删除「令牌交换单独转发」分支：它与统一转发相互矛盾，而且现在不再需要
+ *     （见 prepareForwardHeaders 的说明）。令牌交换按普通请求转发即可。
+ *   · 上游端口始终从宿主的 webServer 热读，不写死 3080/19387。
  */
 'use strict';
 
@@ -18,28 +29,17 @@ import crypto from 'node:crypto';
 
 // ─────────────────────────── 常量 ───────────────────────────
 
-/** force-loopback 要改写的 client bundle 路径。 */
-export const CONN_BUNDLE_PATHNAME = '/plugins/@deepseek-ai/dsh-client-connection/client.js';
-
-/**
- * isLoopback 判定式的候选正则。
- *
- * 第一个是当前 dsh rc.8 的精确原文（已实测匹配）：
- *   isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),
- * 其后两个容忍 dsh 升级后的空白/换行漂移。全部失配时按原样透传并告警，
- * 绝不错改其它内容。
- */
-export const LOOPBACK_PATTERNS = [
-  /isLoopback:\s+pageLocation === void 0 \|\| isLoopbackHostname\(pageLocation\.hostname\)/g,
-  /isLoopback:\s*pageLocation\s*===\s*void 0\s*\|\|\s*isLoopbackHostname\(\s*pageLocation\.hostname\s*\)/g,
-  /isLoopback:\s*[A-Za-z_$][\w$]*\s*===\s*void 0\s*\|\|\s*isLoopbackHostname\(/g,
-];
-
 /** hop-by-hop 头：逐跳语义不能透传；upgrade 场景单独保留 connection/upgrade。 */
 const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
 
 const UPSTREAM_CONNECT_TIMEOUT_MS = 15000;
 const STOP_DRAIN_TIMEOUT_MS = 2000;
+
+/** 需要改写的客户端资源前缀（client-modules 的 bundle 路由）。 */
+const PLUGIN_ROUTE_PREFIX = '/plugins/';
+
+/** 认定为「可改写脚本」的 content-type 前缀。 */
+const SCRIPT_CONTENT_TYPES = ['application/javascript', 'text/javascript', 'application/x-javascript', 'module'];
 
 // ─────────────────────────── 头部工具 ───────────────────────────
 
@@ -85,6 +85,100 @@ export function resolveTarget(host, port) {
   return { hostname: host, port, authority, origin: `http://${authority}` };
 }
 
+// ─────────────────────────── isLoopback 改写 ───────────────────────────
+
+/**
+ * 从一个表达式起点找出它的结束位置（不含结束符）。
+ *
+ * 规则：维护 `()[]{}` 深度；跳过字符串字面量；深度为 0 时遇到 `,` `;` `)`
+ * `}` 或换行即结束。追踪到越界或深度变负则判定失败（返回 -1）。
+ *
+ * @param source - 整段脚本
+ * @param start - 值表达式的第一个字符位置
+ * @returns 结束位置，或 -1（无法可靠判定）
+ */
+function scanExpressionEnd(source, start) {
+  let depth = 0;
+  let i = start;
+  while (i < source.length) {
+    const ch = source[i];
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const quote = ch;
+      i += 1;
+      while (i < source.length) {
+        if (source[i] === '\\') { i += 2; continue; }
+        if (source[i] === quote) break;
+        i += 1;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === '(' || ch === '[' || ch === '{') { depth += 1; i += 1; continue; }
+    if (ch === ')' || ch === ']' || ch === '}') {
+      if (depth === 0) return i;   // 值表达式在容器结束处终止
+      depth -= 1;
+      i += 1;
+      continue;
+    }
+    if (depth === 0 && (ch === ',' || ch === ';' || ch === '\n')) return i;
+    i += 1;
+  }
+  return -1;
+}
+
+/**
+ * 找出脚本里所有 `isLoopback: <expr>` 的可替换片段。
+ *
+ * 只认「键名后跟冒号」的位置，并且要求值表达式里出现 isLoopback / ownsHost /
+ * pageLocation 之一 —— 两道闸门保证不会误改无关代码。
+ *
+ * @param source - 客户端脚本
+ * @returns `[start, end)` 区间数组（区间内容可整体替换）
+ */
+export function findIsLoopbackSpans(source) {
+  const KEY = 'isLoopback:';
+  const spans = [];
+  let cursor = 0;
+  for (;;) {
+    const at = source.indexOf(KEY, cursor);
+    if (at < 0) break;
+    const prev = at === 0 ? '' : source[at - 1];
+    // 只接受「对象字面量里的键」这一种形态
+    if (at !== 0 && !/[{,(\s]/.test(prev)) { cursor = at + KEY.length; continue; }
+    const exprStart = at + KEY.length;
+    const exprEnd = scanExpressionEnd(source, exprStart);
+    if (exprEnd <= exprStart || exprEnd - exprStart > 4000) { cursor = exprStart; continue; }
+    const expr = source.slice(exprStart, exprEnd);
+    if (!/isLoopback|ownsHost|pageLocation/.test(expr)) { cursor = exprEnd; continue; }
+    spans.push([exprStart, exprEnd]);
+    cursor = exprEnd;
+  }
+  return spans;
+}
+
+/**
+ * 把脚本里的 `isLoopback` 值表达式改写成恒 `true`。
+ *
+ * 为什么改值而不是改函数：`isLoopbackHostname(...)` 是对**页面地址**的判断，
+ * 而经隧道访问时页面地址是公网域名，永远判 false。直接把字段值改成 true
+ * 等价于「本次会话视为本机直连」，这正是隧道场景想要的语义。
+ *
+ * @param source - 客户端脚本
+ * @returns `{ body, hits }`；hits=0 表示脚本里没有这个字段
+ */
+export function patchIsLoopback(source) {
+  const spans = findIsLoopbackSpans(source);
+  if (spans.length === 0) return { body: source, hits: 0 };
+  let body = '';
+  let last = 0;
+  for (const [start, end] of spans) {
+    body += source.slice(last, start) + ' true';
+    last = end;
+  }
+  body += source.slice(last);
+  return { body, hits: spans.length };
+}
+
 // ─────────────────────────── 口令认证 ───────────────────────────
 
 /** HMAC-SHA256 签名 Cookie 会话；空口令返回 null（关闭认证）。 */
@@ -126,9 +220,7 @@ export function makeAuth(password) {
       const eq = part.indexOf('=');
       if (eq <= 0) continue;
       try {
-        const k = decodeURIComponent(part.slice(0, eq).trim());
-        const v = decodeURIComponent(part.slice(eq + 1).trim());
-        out[k] = v;
+        out[decodeURIComponent(part.slice(0, eq).trim())] = decodeURIComponent(part.slice(eq + 1).trim());
       } catch {
         /* 忽略非法 cookie */
       }
@@ -170,31 +262,33 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 </html>`;
 
 /**
- * 判断这是否是 **dsh 自己的启动令牌交换**请求。
+ * 判断这是否是 dsh 自己的启动令牌交换请求（`GET /?token=…`）。
  *
- * dsh 的浏览器认证是一次性 token 交换（见 dsh-client-connection 的
- * browser-auth 说明）：
- *   进程启动 → 生成随机 launchToken → 打印/打开 http://<authority>/?token=XXX
- *   → frontend-static 把它交给 authorizeIndex，**只在 `GET /` 接受该 token**
- *   → 写 `dsh-auth-*` 签名 Cookie（名字与 payload 都绑定 authority）→ 302 到 ./
- *   → 之后每个 RPC 请求都要求这个 Cookie，缺失就 401
- *
- * 这个请求必须**原样透传到上游**。如果被本插件的口令认证拦住（返回登录页），
- * token 就永远到不了 dsh，它的 Cookie 一签不出来，用户会一直看到
- *   dsh web authentication required; reopen the URL printed by dsh web
- * 而且再怎么输本插件的口令也没用 —— 那是两套互不相通的认证。
- *
- * @param req - 入站请求
- * @returns true 表示应放行给上游 dsh
+ * 这类请求必须**原样**到达 dsh：token 是一次性凭据，被中转的登录页吃掉就
+ * 再也换不出会话 Cookie。它不是越权入口 —— token 本身就是凭证。
  */
 function isDshTokenExchange(req) {
   if (req.method !== 'GET') return false;
   try {
-    const url = new URL(req.url, 'http://placeholder');
-    return url.searchParams.has('token');
+    return new URL(req.url, 'http://placeholder').searchParams.has('token');
   } catch {
     return false;
   }
+}
+
+/**
+ * 这个未认证请求是否应该看到登录页（而不是裸 401）。
+ *
+ * 两种情形：浏览器请求文档（Accept 含 text/html），或直接访问站点根路径。
+ * 其它情况（API、静态资源、WebSocket）一律 401/401 文本 —— 让前端能明确
+ * 区分「没登录」与「页面没渲染」。
+ */
+function wantsLoginPage(req) {
+  if (req.method !== 'GET') return false;
+  const url = req.url === undefined ? '/' : req.url;
+  if (url === '/' || url === '/index.html' || url.startsWith('/?')) return true;
+  const accept = req.headers.accept;
+  return typeof accept === 'string' && accept.includes('text/html');
 }
 
 /**
@@ -204,8 +298,7 @@ function isDshTokenExchange(req) {
 function authGate(req, res, socket, auth, password, log) {
   if (!auth) return true;
 
-  // dsh 的启动令牌交换优先放行 —— 必须早于本插件自己的任何认证判断，
-  // 否则 token 被登录页吃掉，dsh 的会话永远建不起来（见函数注释）。
+  // dsh 的启动令牌交换优先放行（见 isDshTokenExchange 注释）。
   if (isDshTokenExchange(req)) {
     log?.('info', `放行 dsh 启动令牌交换：${req.url}`);
     return true;
@@ -214,7 +307,6 @@ function authGate(req, res, socket, auth, password, log) {
   const token = auth.parseCookies(req)[auth.cookieName];
   if (auth.verifyToken(token)) return true;
 
-  // 登录提交
   if (req.method === 'POST' && req.url === '/__login') {
     let body = '';
     let over = false;
@@ -256,8 +348,7 @@ function authGate(req, res, socket, auth, password, log) {
     return false;
   }
 
-  // 未登录
-  if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
+  if (wantsLoginPage(req)) {
     if (res) {
       const page = auth.LOGIN_PAGE.replace('__ERR__', '');
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
@@ -280,14 +371,11 @@ function authGate(req, res, socket, auth, password, log) {
 /**
  * 建一个中转实例。
  *
- * @param options.getDshEndpoint - () => { host, port }，本进程 dsh 的真实监听端口（惰性求值）
- * @param options.getConfig      - () => { listenHost, listenPort, password, forceLoopback, targetHost, targetPort, autoSession }
+ * @param options.getDshEndpoint - () => { host, port }，本进程 dsh 的真实监听端点（惰性求值）
+ * @param options.getConfig      - () => 归一化后的配置
  * @param options.log            - (level, message) => void，可选
- * @param options.sessionSigner  - dsh 会话代签器（createSessionSigner 的返回值）。
- *                                 提供且 autoSession 开启时，会在转发前替浏览器补签
- *                                 dsh 的会话 Cookie，用户只输中转口令即可进入。
- *                                 省略则完全维持原行为（需要 dsh 打印的 ?token=）。
- * @returns { start, stop, status, patchBundle }
+ * @param options.sessionSigner  - dsh 会话代签器；提供且 autoSession 开启时补签会话 Cookie
+ * @returns { start, stop, status }
  */
 export function createRelay(options = {}) {
   const { getDshEndpoint, getConfig, log = () => {}, sessionSigner = null } = options;
@@ -300,10 +388,10 @@ export function createRelay(options = {}) {
   let stopping = false;
   let startedAt = 0;
   let lastError = null;
-  /** 实际绑定的监听参数（只有它需要重新 listen 才能改）。 */
   let boundListen = null;
   let requestCount = 0;
-  /** 按口令缓存 auth 对象：口令变了立即重建，运行中改口令无需重启。 */
+  let patchCount = 0;
+  let patchMisses = 0;
   let authCache = { password: undefined, auth: null };
 
   function cfg() {
@@ -311,30 +399,26 @@ export function createRelay(options = {}) {
     return {
       listenHost: c.listenHost || '127.0.0.1',
       listenPort: Number.isInteger(c.listenPort) ? c.listenPort : 3091,
-      password: c.password ?? '',
-      forceLoopback: c.forceLoopback !== false,
+      // 上游覆盖是白名单式重建：新增配置项必须在这里显式带上，
+      // 否则会静默变成 undefined，让下游的开关形同虚设。
       targetHost: c.targetHost || null,
       targetPort: c.targetPort == null ? null : Number(c.targetPort),
-      // 注意：这是白名单式重建，新增配置项必须在这里显式带上，
-      // 否则会静默变成 undefined，让下游的开关形同虚设
-      // （autoSession 曾因漏掉这一行而「关不掉」）。
+      password: c.password ?? '',
+      forceLoopback: c.forceLoopback !== false,
       autoSession: c.autoSession !== false,
     };
   }
 
-  /**
-   * 当前生效的认证器。口令是热配置：改了立刻重建，不用重启中转。
-   * getConfig() 每次调用都读最新值，所以这里只需按口令值缓存。
-   */
   function currentAuth() {
     const password = cfg().password;
-    if (authCache.password !== password) {
-      authCache = { password, auth: makeAuth(password) };
-    }
+    if (authCache.password !== password) authCache = { password, auth: makeAuth(password) };
     return authCache.auth;
   }
 
-  /** 上游目标：显式覆盖优先，否则取本进程 dsh 的真实端口（热读）。 */
+  /**
+   * 上游目标：显式覆盖优先（代理另一个 dsh 实例的场景），
+   * 否则永远取本进程 dsh 的真实端点（热读，不写死端口）。
+   */
   function target() {
     const c = cfg();
     const dsh = getDshEndpoint();
@@ -343,56 +427,45 @@ export function createRelay(options = {}) {
     return resolveTarget(host, port);
   }
 
-  function shouldPatchBundle(req, c) {
-    if (!c.forceLoopback) return false;
-    try {
-      return new URL(req.url, 'http://x').pathname === CONN_BUNDLE_PATHNAME;
-    } catch {
-      return false;
-    }
-  }
-
   /**
-   * 按需替浏览器补签 dsh 的会话 Cookie，并返回最终要发往上游的头。
+   * 准备要发往上游的头。
    *
-   * 为什么绑定 TARGET.authority：转发时 rewriteHeaders 会把 Host 改写成它，
-   * 而 dsh 校验 `payload.authority === 本次请求的 Host` —— 两者必须一致，
-   * 否则签出来的 cookie 会被判为「authority 不匹配」而拒绝。
+   * 两件事：
+   *   1. rewriteHeaders：Host/Origin 改成回环权威，过 dsh 的信任栅栏；
+   *   2. autoSession 时补签 dsh 会话 Cookie。
    *
-   * 失败一律**不注入**并原样转发：退回「需要 dsh 打印的 ?token=」的现状，
-   * 不让代签的失败变成完全进不去。
+   * 关于第 2 点为什么不用 dsh 的 `?token=` 交换：代签的 Cookie 名与 payload
+   * 都绑定「本次请求的 authority」，而 rewriteHeaders 已把 Host 改成回环权威，
+   * 所以只要按 TARGET.authority 签，dsh 校验必然通过。反之若保留浏览器的
+   * 隧道 authority，就过不了信任栅栏 —— 这也是旧版本要写「先原样、被拒再回退」
+   * 两段式的原因。代签把这条弯路整个去掉了。
    *
-   * @param req    - 入站请求
-   * @param forUpgrade - 是否 WebSocket upgrade
-   * @param TARGET - 上游目标
-   * @param c      - 当前配置
+   * 代签失败一律**不注入**并原样转发：退回「用 dsh 打印的 ?token=」的现状，
+   * 不让失败的代签变成完全进不去。
    */
   function prepareForwardHeaders(req, forUpgrade, TARGET, c) {
     const headers = rewriteHeaders(req.headers, forUpgrade, TARGET);
-
     if (!sessionSigner || c.autoSession === false) return headers;
-    // 没有中转口令时不代签：否则等于把 dsh 会话无条件送出去。
-    if (!c.password) return headers;
-
+    if (!c.password) return headers;   // 无口令时不代签：等价于无条件送出 dsh 会话
     try {
       const out = sessionSigner.checkout(TARGET.authority, headers.cookie);
-      if (out.injected && out.cookieHeader) {
-        headers.cookie = out.cookieHeader;
-      }
+      if (out.injected && out.cookieHeader) headers.cookie = out.cookieHeader;
     } catch (err) {
       log('warn', `[dsh-cookie] 代签失败，本次按原样转发：${err?.message || err}`);
     }
     return headers;
   }
 
-  // ── bundle 改写（缓冲代理）──
-  function handlePatchedBundle(req, res, TARGET, c) {
-    // 走统一的转发头准备：bundle 请求同样需要补签会话 Cookie，
-    // 否则浏览器拿不到 authenticated 的页面就会停在 401 页，bundle 也不会被请求。
+  /** 这个响应是不是可改写的客户端脚本。 */
+  function isScriptResponse(proxyRes) {
+    const type = String(proxyRes.headers['content-type'] || '').toLowerCase();
+    return SCRIPT_CONTENT_TYPES.some((prefix) => type.startsWith(prefix));
+  }
+
+  // ── force-loopback：改写客户端脚本 ──
+  function handlePatchedScript(req, res, TARGET, c) {
     const headers = prepareForwardHeaders(req, false, TARGET, c);
-    // 剥离压缩，保证上游返回明文，改写才能命中
-    delete headers['accept-encoding'];
-    headers['accept-encoding'] = 'identity';
+    headers['accept-encoding'] = 'identity';   // 上游必须给明文，改写才能命中
 
     const proxyReq = http.request({
       hostname: TARGET.hostname,
@@ -406,13 +479,17 @@ export function createRelay(options = {}) {
 
     proxyReq.on('response', (proxyRes) => {
       clearTimeout(timer);
-      const status = proxyRes.statusCode;
+      const status = proxyRes.statusCode ?? 502;
       const upstreamHeaders = stripHopByHop(proxyRes.headers);
-      const encoding = (proxyRes.headers['content-encoding'] || '').toLowerCase();
+      const encoding = String(proxyRes.headers['content-encoding'] || '').toLowerCase();
 
-      // 非 200 或已压缩 → 原样透传（不改写）
-      if (status !== 200 || (encoding && encoding !== 'identity')) {
-        if (encoding && encoding !== 'identity') {
+      // 三条「不该缓冲」的判据：
+      //   · 非 200
+      //   · 上游还是压缩了（改成 identity 失效）
+      //   · 根本不是一个 JS 资源 —— 尤其是 /plugins/events 这种 SSE 长连接，
+      //     缓冲会把流挂死，必须原样 pipe。
+      if (status !== 200 || (encoding !== '' && encoding !== 'identity') || !isScriptResponse(proxyRes)) {
+        if (encoding !== '' && encoding !== 'identity') {
           log('warn', `force-loopback: 上游响应已压缩 (${encoding})，已按原样透传`);
         }
         res.writeHead(status, proxyRes.statusMessage, upstreamHeaders);
@@ -422,34 +499,28 @@ export function createRelay(options = {}) {
       }
 
       const chunks = [];
-      proxyRes.on('data', (c) => chunks.push(c));
+      proxyRes.on('data', (chunk) => chunks.push(chunk));
       proxyRes.on('end', () => {
         const original = Buffer.concat(chunks);
-        const body = original.toString('utf-8');
+        const text = original.toString('utf-8');
+        const { body, hits } = patchIsLoopback(text);
 
-        // 逐个候选正则试，命中即停；全部失配则原样转发并告警
-        let patched = body;
-        let hit = false;
-        for (const re of LOOPBACK_PATTERNS) {
-          re.lastIndex = 0;
-          patched = body.replace(re, 'isLoopback: true');
-          if (patched !== body) {
-            hit = true;
-            break;
-          }
-        }
-
-        if (hit) {
-          log('info', `force-loopback: 已改写 bundle ${body.length} → ${patched.length} 字节`);
+        if (hits > 0) {
+          patchCount += 1;
+          log('info', `force-loopback: 已改写 ${hits} 处 isLoopback（${original.length} → ${Buffer.byteLength(body, 'utf-8')} 字节）`);
           delete upstreamHeaders['content-length'];
           delete upstreamHeaders['transfer-encoding'];
-          upstreamHeaders['content-length'] = Buffer.byteLength(patched, 'utf-8');
+          upstreamHeaders['content-length'] = Buffer.byteLength(body, 'utf-8');
           upstreamHeaders['cache-control'] = 'no-store';   // 避免跨版本缓存混乱
           res.writeHead(200, upstreamHeaders);
-          res.end(patched);
+          res.end(body);
         } else {
-          log('warn', 'force-loopback: 未找到目标模式，可能 dsh 已升级，已按原样转发（公网侧插件列表可能为空）');
-          res.writeHead(status, upstreamHeaders);
+          patchMisses += 1;
+          if (patchMisses <= 3) {
+            log('warn', `force-loopback: 该脚本里没有 isLoopback 字段（${req.url}），按原样转发`);
+          }
+          // 没命中多半是「这个脚本本来就不含该字段」，属正常；保留原字节。
+          res.writeHead(status, proxyRes.statusMessage, upstreamHeaders);
           res.end(original);
         }
       });
@@ -478,27 +549,26 @@ export function createRelay(options = {}) {
   // ── dsh 启动令牌交换的专门转发 ──
 
   /**
-   * 转发 dsh 的 `GET /?token=...` 令牌交换，并**保留浏览器原始的 Host/Origin**。
+   * 转发 dsh 的 `GET /?token=…` 令牌交换，并**保留浏览器的原始 Host/Origin**。
    *
-   * 为什么不复用 rewriteHeaders：
-   *   它把 Host/Origin 写成上游回环权威，是为了过 `isTrustedApiRequest` 的信任栅栏。
-   *   但 dsh 的 cookie 名与 payload 都绑定「请求的 authority」：
-   *       cookieName(authority) = 'dsh-auth-' + sha256(authority)
-   *   若这里把 authority 改写成 127.0.0.1:<dsh端口>，签出的 cookie 就属于那个
-   *   权威；而浏览器地址栏里是隧道域名或中转端口，两者不等 → cookie 取不出来
-   *   → 永远 `authentication required`。
+   * 为什么只在「不代签」时才走这条路：
    *
-   * 代价与取舍：保留原始 Host 意味着 `isTrustedApiRequest` 可能拒绝它
-   *   （Host 既不是 loopback 也不在 trustedHosts 里 → 403）。
-   *   这正是本方案要用户侧做的一件事：把中转对外使用的 authority 写进 dsh 的
-   *   `trustedHosts`；或者由下面的 403 回退分支自动改用回环权威重试一次
-   *   （cookie 会挂到回环权威，用户需要以该地址访问；见 README 排障）。
+   *   dsh 的 cookie 名与 payload 都绑定「请求的 authority」：
+   *       cookieName(authority) = 'dsh-auth-' + base64url(sha256(authority))
+   *   若这里把 authority 改写成 127.0.0.1:<dsh端口>，签出的 cookie 属于那个
+   *   权威；而浏览器地址栏里是隧道域名/中转端口，取不出来 → 永远
+   *   `authentication required`。
    *
-   * 因此这里做「先原样、被拒再回退」两段式，两条路都试过再报错，
-   * 不把任何一种部署形态卡死。
+   *   但**代签**恰好把这条弯路去掉了：我们按上游权威签 cookie 并直接注入，
+   *   dsh 只校验签名与 authority 匹配，与浏览器地址栏无关。所以：
+   *     · autoSession 生效中 → 走普通转发（快、只有一个分支）；
+   *     · 否则 → 走本函数保留 authority，让 dsh 自己签。
+   *
+   * 保留 authority 的代价是可能撞上信任栅栏（Host 既非回环也不在
+   * trustedHosts 里 → 403）。所以下面做「先原样、被拒再回退回环权威」两段式，
+   * 两条路都试过再报错，不把任何一种部署形态卡死。
    */
   function forwardTokenExchange(req, res, TARGET, triedFallback = false) {
-    // 保留浏览器的 authority；只剥离逐跳头，不做 Host/Origin 改写。
     const headers = stripHopByHop(req.headers);
 
     const proxyReq = http.request({
@@ -520,19 +590,18 @@ export function createRelay(options = {}) {
       const status = proxyRes.statusCode || 502;
 
       // 上游拒绝这个 authority（信任栅栏）：改成回环权威重试一次。
-      // 只有在还没重试过、且确实是 403/401 时才回退，避免掩盖真实业务错误。
+      // 只在还没重试过、且确实是 403/401 时才回退，避免掩盖真实业务错误。
       if (!triedFallback && !retried && (status === 403 || status === 401)) {
         retried = true;
         log('warn', `令牌交换被上游以 ${status} 拒绝（authority 未受信），改用回环权威重试：${req.url}`);
-        proxyRes.resume(); // 丢弃这次响应体，随后重发
+        proxyRes.resume();   // 丢弃这次响应体，随后重发
         forwardTokenExchange(req, res, TARGET, true);
         return;
       }
 
-      const outHeaders = stripHopByHop(proxyRes.headers);
-      // dsh 会下发 Set-Cookie（dsh-auth-*）。必须原样透传：它已经是 host-only /
-      // Path=/ / HttpOnly / SameSite=Strict，属性正确，任何改写都会让它失效。
-      res.writeHead(status, proxyRes.statusMessage, outHeaders);
+      // dsh 下发的 Set-Cookie 必须原样透传：它已经是 host-only / Path= /
+      // HttpOnly / SameSite，任何改写都会让它失效。
+      res.writeHead(status, proxyRes.statusMessage, stripHopByHop(proxyRes.headers));
       proxyRes.pipe(res);
       proxyRes.on('error', () => res.destroy());
     });
@@ -556,24 +625,31 @@ export function createRelay(options = {}) {
     req.pipe(proxyReq);
   }
 
-  // ── HTTP 代理 ──
+  // ── 普通 HTTP 代理 ──
   function handleRequest(req, res, auth, c) {
-    requestCount++;
+    requestCount += 1;
     if (!authGate(req, res, null, auth, c.password, log)) return;
 
     const TARGET = target();
-    if (shouldPatchBundle(req, c)) return handlePatchedBundle(req, res, TARGET, c);
 
-    // dsh 的启动令牌交换：单独转发，走「保留浏览器原始 authority」的头策略。
-    // 理由见 isDshTokenExchange 的注释 —— dsh 要按请求的 authority 签名 cookie，
-    // 若把它改写成上游回环权威，签出的 cookie 会挂到 127.0.0.1:19387 上，
-    // 而浏览器实际访问的是隧道域名/中转端口，于是 cookie 永远对不上、一直 401。
-    if (isDshTokenExchange(req)) {
+    // 令牌交换且不代签 → 保留浏览器原始 authority，让 dsh 自己按它签 cookie。
+    // 代签生效时不需要这条路（详见 forwardTokenExchange 的说明）。
+    if (isDshTokenExchange(req) && !(sessionSigner && c.autoSession !== false && c.password)) {
       return forwardTokenExchange(req, res, TARGET);
     }
 
-    // 统一走 prepareForwardHeaders：它会改写 Host/Origin，并在开启
-    // autoSession 时替浏览器补签 dsh 的会话 Cookie。
+    // force-loopback 只对客户端脚本生效。先按「探针」方式发一次上游是浪费，
+    // 所以这里用路径前缀粗筛：/plugins/ 之下才可能是客户端 bundle。
+    // 真正的判定仍在响应侧用 content-type 做，避免误缓冲 SSE（/plugins/events）。
+    let pathname = '/';
+    try {
+      pathname = new URL(req.url ?? '/', 'http://x').pathname;
+    } catch {
+      pathname = '/';
+    }
+    const possiblyScript = c.forceLoopback && pathname.startsWith(PLUGIN_ROUTE_PREFIX);
+    if (possiblyScript) return handlePatchedScript(req, res, TARGET, c);
+
     const headers = prepareForwardHeaders(req, false, TARGET, c);
     const proxyReq = http.request({
       hostname: TARGET.hostname,
@@ -617,8 +693,7 @@ export function createRelay(options = {}) {
     if (!authGate(req, null, socket, auth, c.password, log)) return;
 
     const TARGET = target();
-    // WebSocket 也要补签：dsh 的 RPC 下行流与事件推送都走 upgrade，
-    // 没有会话 Cookie 会被直接拒握手。
+    // WebSocket 也要补签：dsh 的 RPC 下行流与事件推送都走 upgrade。
     const headers = prepareForwardHeaders(req, true, TARGET, c);
     const proxyReq = http.request({
       hostname: TARGET.hostname,
@@ -800,7 +875,6 @@ export function createRelay(options = {}) {
       };
       const timer = setTimeout(finish, STOP_DRAIN_TIMEOUT_MS);
 
-      // 强制断开 keep-alive 与已升级的 WS，close 回调才能及时到
       try {
         srv.closeAllConnections?.();
       } catch {
@@ -820,7 +894,6 @@ export function createRelay(options = {}) {
   /** 当前状态快照（UI 与工具都读它）。 */
   function status() {
     const c = cfg();
-    // 监听部分：运行中用实际绑定值，停止时用配置值（UI 才能预先显示将要绑定的端口）
     const listenHost = running && boundListen ? boundListen.host : c.listenHost;
     const listenPort = running && boundListen ? boundListen.port : c.listenPort;
     let targetInfo = null;
@@ -843,6 +916,8 @@ export function createRelay(options = {}) {
       hasPassword: Boolean(c.password),
       connections: liveSockets.size,
       requests: requestCount,
+      patchedScripts: patchCount,
+      patchMisses,
       startedAt: running ? startedAt : null,
       uptimeMs: running ? Date.now() - startedAt : 0,
       lastError,

@@ -13,6 +13,8 @@
  */
 import http from 'node:http';
 import net from 'node:net';
+import fs from 'node:fs';
+import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 
@@ -123,66 +125,21 @@ async function callRoute(host, method, pathname, options = {}) {
 /**
  * 假 Cordis ctx：只实现插件用到的那部分。
  *
- * 关键点：插件的配置来源是 settings 命名空间（由 installSettingsSection 接线），
- * 所以这里必须提供一个可用的 settings 假实现 + 能跑 inject(['settings']) 的机制，
- * 否则测不到配置读写这条主路径。
+ * **配置来源已变更（0.2.0）**：插件不再依赖 settings 命名空间，配置由它自己
+ * 的 JSON 文件持有（路径来自 ctx.profileContext.home）。所以这里提供一个
+ * 临时目录作为 profile home，避免测试写脏真实 profile。
  */
 function makeCtx({ webPort, webHost = '127.0.0.1', entryConfig = {} }) {
   const routes = new Map();
   const effects = [];
   const logLines = [];
   const registeredTools = [];
-  /** 仿 settings 的注册表：namespace -> { value, revision } */
-  const settingsStore = new Map();
-
-  function makeSettingsService() {
-    return {
-      register(ns, schema, options) {
-        // 用 schema 的默认值 resolve 一次，模拟真实解析（defaults + base）
-        let resolved;
-        try {
-          resolved = typeof schema === 'function' ? schema(options?.base ?? {}) : (options?.base ?? {});
-        } catch {
-          resolved = options?.base ?? {};
-        }
-        const record = { value: resolved, revision: 0 };
-        settingsStore.set(ns, record);
-        return {
-          get: () => record.value,
-          watch: () => () => {},
-          async update(patch) {
-            record.value = { ...record.value, ...patch };
-            record.revision += 1;
-          },
-          async replace(section) {
-            record.value = { ...section };
-            record.revision += 1;
-          },
-        };
-      },
-      describe: () => [...settingsStore.entries()].map(([ns, r]) => ({
-        ns, value: r.value, revision: r.revision, schema: {}, applies: 'live',
-      })),
-      get: (ns) => settingsStore.get(ns)?.value,
-      async update(ns, patch) {
-        const r = settingsStore.get(ns);
-        if (!r) throw new Error(`namespace not registered: ${ns}`);
-        r.value = { ...r.value, ...patch };
-        r.revision += 1;
-      },
-      async replace(ns, section) {
-        const r = settingsStore.get(ns);
-        if (!r) throw new Error(`namespace not registered: ${ns}`);
-        r.value = { ...section };
-        r.revision += 1;
-      },
-      async mutate() { throw new Error('not used in this test'); },
-    };
-  }
-
-  const settingsService = makeSettingsService();
+  // 每个 ctx 一份独立的临时 profile home（测试之间互不干扰，也不碰真实 ~/.dsh）
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-relay-test-'));
 
   const ctx = {
+    // 与真实宿主一致：dir 是这个 profile 的目录，home 是 $DSH_HOME 根。
+    profileContext: { dir: home, home: path.dirname(home), name: 'test' },
     webServer: {
       host: webHost,
       port: webPort,
@@ -202,32 +159,26 @@ function makeCtx({ webPort, webHost = '127.0.0.1', entryConfig = {} }) {
       effects.push({ cleanup, label });
       return () => { if (typeof cleanup === 'function') cleanup(); };
     },
-    /** installSettingsSection 内部用 ctx.inject(['settings'], cb) 接线。 */
-    inject(services, callback) {
-      const list = Array.isArray(services) ? services : [services];
-      if (list.includes('settings')) {
-        const scoped = {
-          settings: settingsService,
-          effect(fn) {
-            const cleanup = fn();
-            effects.push({ cleanup, label: 'settings scoped' });
-            return () => { if (typeof cleanup === 'function') cleanup(); };
-          },
-          fiber: { state: 0 },
-        };
-        callback(scoped);
-      }
-    },
     get(name) {
-      if (name === 'settings') return settingsService;
       if (name === 'tools') {
         return { register: (def) => { registeredTools.push(def); return () => {}; } };
       }
+      // 故意不提供 settings：0.2.0 起插件不依赖它，这条路径必须照样工作。
       return undefined;
     },
   };
 
-  return { ctx, routes, effects, logLines, registeredTools, settingsStore };
+  /** 读插件落盘的配置文件（测试断言用）。 */
+  function readConfigFile() {
+    const file = path.join(home, 'dsh-public-relay.json');
+    try {
+      return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      return undefined;
+    }
+  }
+
+  return { ctx, routes, effects, logLines, registeredTools, home, readConfigFile };
 }
 
 // ═══════════════════════════ 主流程 ═══════════════════════════
@@ -374,7 +325,7 @@ async function main() {
     check('toggle 后端口已释放', await portListening(relayPort) === false, `port ${relayPort} still listening`);
   }
 
-  section('配置写入（走 settings 命名空间）');
+  section('配置写入（自有 JSON 文件，不依赖 settings 服务）');
   {
     const saved = await callRoute(host, 'POST', '/dsh-public-relay/config', {
       headers: { origin: `http://127.0.0.1:${dshPort}` },
@@ -382,18 +333,19 @@ async function main() {
     });
     check('config 路由返回 200', saved.status === 200, `got ${saved.status}`);
 
-    // 持久化落在 settings 命名空间里（与设置页同一份存储）
-    const rec = h.settingsStore.get('dsh-public-relay');
-    check('settings 命名空间已注册', rec !== undefined, 'namespace missing');
+    // 持久化落在 profile home 下的 JSON 文件里
+    const rec = h.readConfigFile();
+    check('配置文件已写出', rec !== undefined, 'config file missing');
     if (rec) {
-      check('命名空间里口令已更新', rec.value.password === 'new-pass', `got ${rec.value.password}`);
-      check('命名空间里端口正确', Number(rec.value.listenPort) === relayPort, `got ${rec.value.listenPort}`);
-      check('写入推进了 revision', rec.revision > 0, `revision=${rec.revision}`);
+      check('文件里口令已更新', rec.password === 'new-pass', `got ${rec.password}`);
+      check('文件里端口正确', Number(rec.listenPort) === relayPort, `got ${rec.listenPort}`);
+      check('文件里没有派生字段', rec.autoSessionWanted === undefined, JSON.stringify(Object.keys(rec)));
     }
 
     const statusAfter = JSON.parse((await callRoute(host, 'GET', '/dsh-public-relay/status')).body);
     check('新口令立即生效（hasPassword=true）', statusAfter.hasPassword === true, `got ${statusAfter.hasPassword}`);
-    check('status 回报 settings 命名空间名', statusAfter.settingsNamespace === 'dsh-public-relay', `got ${statusAfter.settingsNamespace}`);
+    check('status 回报配置文件路径', statusAfter.configFile === path.join(h.home, 'dsh-public-relay.json'),
+      `got ${statusAfter.configFile}`);
   }
 
   section('自动会话：口令为空时保存的是「用户原意」');
@@ -407,9 +359,9 @@ async function main() {
     });
     check('清空口令 + 开着自动会话 → 写入成功', saved.status === 200, `got ${saved.status} ${saved.body}`);
 
-    const rec = h.settingsStore.get('dsh-public-relay');
+    const rec = h.readConfigFile();
     check('存储里保留用户原意 autoSession=true',
-      rec && rec.value.autoSession === true, JSON.stringify(rec && rec.value.autoSession));
+      rec !== undefined && rec.autoSession === true, JSON.stringify(rec && rec.autoSession));
 
     const snap = JSON.parse((await callRoute(host, 'GET', '/dsh-public-relay/status')).body);
     check('生效值被压成 false（安全硬约束）', snap.config.autoSession === false, String(snap.config.autoSession));

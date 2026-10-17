@@ -1,0 +1,12 @@
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="DSH Relay">
+  <rect x="4.5" y="6.5" width="27" height="23" rx="4" fill="url(#bg)" />
+  <path d="M11 18h4.5M20.5 18H25" stroke="#BFF6E4" stroke-width="2.2" stroke-linecap="round" />
+  <path d="M17.2 12.6 22 18l-4.8 5.4" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="27.5" cy="9.5" r="2.6" fill="#45E7A4" stroke="#0B1220" stroke-width="1.2" />
+  <defs>
+    <linearGradient id="bg" x1="4.5" y1="6.5" x2="31.5" y2="29.5" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2F6FE0" />
+      <stop offset="1" stop-color="#0F8A9E" />
+    </linearGradient>
+  </defs>
+</svg>
