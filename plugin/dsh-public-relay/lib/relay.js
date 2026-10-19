@@ -26,6 +26,7 @@
 
 import http from 'node:http';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 
 // ─────────────────────────── 常量 ───────────────────────────
 
@@ -40,6 +41,22 @@ const PLUGIN_ROUTE_PREFIX = '/plugins/';
 
 /** 认定为「可改写脚本」的 content-type 前缀。 */
 const SCRIPT_CONTENT_TYPES = ['application/javascript', 'text/javascript', 'application/x-javascript', 'module'];
+
+/**
+ * 真正需要改写 `isLoopback` 的包。
+ *
+ * 为什么要这张白名单：`isLoopback` 这个字段只在 0.2.x 的
+ * `@deepseek-ai/dsh-client-connection` 里定义（实测全量扫过 85 个 combo
+ * bundle，只有它的产物带这个键）。旧实现却对**整个 `/plugins/`** 强制
+ * `accept-encoding: identity` 并整体缓冲 —— 结果是 85 个 bundle 全部被解压
+ * 重传，实测启动流量从 10.29 MB（gzip）膨胀到 26.18 MB（2.55x）。
+ *
+ * 只对白名单内的包做「解压 → 改写 → 重压」，其余请求**完全按普通代理透传**，
+ * 让 dsh 自己的 gzip 与强缓存照常生效。
+ */
+const LOOPBACK_PATCH_PACKAGES = [
+  '@deepseek-ai/dsh-client-connection',
+];
 
 // ─────────────────────────── 头部工具 ───────────────────────────
 
@@ -177,6 +194,96 @@ export function patchIsLoopback(source) {
   }
   body += source.slice(last);
   return { body, hits: spans.length };
+}
+
+// ─────────────────────────── 目标集判定 ───────────────────────────
+
+/**
+ * 这个请求是否指向「需要改写 isLoopback」的客户端 bundle。
+ *
+ * 两种 URL 形态都要认（0.2.x 的 client-modules 会同时用到）：
+ *   · 单资源 combo：`/plugins/??@scope/pkg/client.js&rev=…`
+ *   · 批量 combo：  `/plugins/??a/client.js,b/client.js&rev=…`（可能很长）
+ *
+ * 判定方式：取 `??` 之后、`&rev=` 之前的资源列表，按 `/client.js` 切分，
+ * 只要其中有白名单包就返回 true。**不**匹配 `/plugins/events` 这类 SSE 路径。
+ *
+ * @param url - 原始请求 URL
+ * @returns 是否属于改写目标
+ */
+export function isLoopbackPatchTarget(url) {
+  if (typeof url !== 'string' || !url.startsWith(PLUGIN_ROUTE_PREFIX)) return false;
+  const q = url.indexOf('??');
+  if (q < 0) return false;
+  const rest = url.slice(q + 2);
+  const amp = rest.indexOf('&');
+  const list = amp < 0 ? rest : rest.slice(0, amp);
+  if (list === '') return false;
+  for (const entry of list.split(',')) {
+    if (!entry.endsWith('/client.js')) continue;
+    const pkg = entry.slice(0, -'/client.js'.length);
+    if (LOOPBACK_PATCH_PACKAGES.includes(pkg)) return true;
+  }
+  return false;
+}
+
+/**
+ * 解码上游响应体：按 `content-encoding` 解成明文；解不了就返回 null。
+ *
+ * 支持 gzip / br / deflate / identity —— 覆盖 dsh 的 webserver 会产出的全部编码
+ * （它用 `compression` 中间件，实测协商结果只会是 gzip 或 identity）。
+ *
+ * @param buffer - 上游原始字节
+ * @param encoding - `content-encoding` 头（已 lowercase）
+ * @returns 明文 Buffer，或 null（不认识的编码）
+ */
+export function decodeBody(buffer, encoding) {
+  switch (encoding) {
+    case '':
+    case 'identity':
+      return buffer;
+    case 'gzip':
+    case 'x-gzip':
+      return zlib.gunzipSync(buffer);
+    case 'deflate':
+      return zlib.inflateSync(buffer);
+    case 'br':
+      return zlib.brotliDecompressSync(buffer);
+    default:
+      return null;
+  }
+}
+
+/**
+ * 按同样的 `content-encoding` 压回去，保持与上游一致的传输体积。
+ *
+ * 只用最快的档位：这些是静态脚本，解压后的体积本来就不大，
+ * 压缩档位对整体延迟的影响远小于「不压缩」。
+ *
+ * @param buffer - 明文（改写后）的字节
+ * @param encoding - 原本的 `content-encoding`（已 lowercase）
+ * @returns 压缩后的字节；identity 原样返回
+ */
+export function encodeBody(buffer, encoding) {
+  switch (encoding) {
+    case '':
+    case 'identity':
+      return buffer;
+    case 'gzip':
+    case 'x-gzip':
+      return zlib.gzipSync(buffer, { level: 1 });
+    case 'deflate':
+      return zlib.deflateSync(buffer, { level: 1 });
+    case 'br':
+      return zlib.brotliCompressSync(buffer, {
+        params: {
+          [zlib.constants.BROTLI_PARAM_QUALITY]: 1,
+          [zlib.constants.BROTLI_PARAM_SIZE_HINT]: buffer.length,
+        },
+      });
+    default:
+      throw new Error(`unsupported content-encoding: ${encoding}`);
+  }
 }
 
 // ─────────────────────────── 口令认证 ───────────────────────────
@@ -392,7 +499,36 @@ export function createRelay(options = {}) {
   let requestCount = 0;
   let patchCount = 0;
   let patchMisses = 0;
+  let passthroughCount = 0;
   let authCache = { password: undefined, auth: null };
+
+  /**
+   * 打给上游的 keep-alive 连接池。
+   *
+   * 旧实现每处转发都写 `agent: false`（= 不复用、每个请求新建 TCP）。在
+   * 隧道场景下这条链路上每一跳的握手都更贵，实测 TIME_WAIT 会随请求数线性
+   * 堆积。这里集中复用一个 agent；WebSocket upgrade 仍不用它（升级连接本来
+   * 就是长连接，复用没有意义）。
+   *
+   * 注意：`stop()` 会 destroy 它，所以 `start()` 必须先确保它可用（见
+   * ensureAgent）——否则「停用后再启用」会拿到一个已销毁的 agent。
+   */
+  let upstreamAgent = createUpstreamAgent();
+
+  function createUpstreamAgent() {
+    return new http.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 15000,
+      maxSockets: 64,
+      maxFreeSockets: 16,
+      timeout: 60000,
+    });
+  }
+
+  function ensureAgent() {
+    if (upstreamAgent.destroyed === true) upstreamAgent = createUpstreamAgent();
+    return upstreamAgent;
+  }
 
   function cfg() {
     const c = getConfig() ?? {};
@@ -462,10 +598,22 @@ export function createRelay(options = {}) {
     return SCRIPT_CONTENT_TYPES.some((prefix) => type.startsWith(prefix));
   }
 
-  // ── force-loopback：改写客户端脚本 ──
+  /**
+   * force-loopback：改写目标 bundle 的 `isLoopback`。
+   *
+   * 只对白名单包（见 LOOPBACK_PATCH_PACKAGES）调用；其余 `/plugins/` 请求走
+   * 普通转发，压缩与强缓存原样保留。
+   *
+   * 改写方式是**先按上游给的编码解压、改完再按同一编码压回去**：
+   *   · 不再强制 `accept-encoding: identity` —— 那会让 dsh 放弃压缩，
+   *     实测把启动流量从 10.29 MB 抬到 26.18 MB；
+   *   · 也不再丢掉 `cache-control` —— dsh 的 combo URL 自带 `rev=<hash>`，
+   *     内容变了 URL 就变，天然可长期缓存，写 `no-store` 只会让每次刷新重下。
+   */
   function handlePatchedScript(req, res, TARGET, c) {
     const headers = prepareForwardHeaders(req, false, TARGET, c);
-    headers['accept-encoding'] = 'identity';   // 上游必须给明文，改写才能命中
+    // 保留浏览器的 accept-encoding：让上游照常压缩，我们解压再重压。
+    // 若上游只肯给 identity，下面的 encoding 分支同样能处理。
 
     const proxyReq = http.request({
       hostname: TARGET.hostname,
@@ -473,7 +621,7 @@ export function createRelay(options = {}) {
       method: req.method,
       path: req.url,
       headers,
-      agent: false,
+      agent: ensureAgent(),
     });
     const timer = setTimeout(() => proxyReq.destroy(new Error('upstream connect timeout')), UPSTREAM_CONNECT_TIMEOUT_MS);
 
@@ -483,14 +631,14 @@ export function createRelay(options = {}) {
       const upstreamHeaders = stripHopByHop(proxyRes.headers);
       const encoding = String(proxyRes.headers['content-encoding'] || '').toLowerCase();
 
-      // 三条「不该缓冲」的判据：
-      //   · 非 200
-      //   · 上游还是压缩了（改成 identity 失效）
-      //   · 根本不是一个 JS 资源 —— 尤其是 /plugins/events 这种 SSE 长连接，
-      //     缓冲会把流挂死，必须原样 pipe。
-      if (status !== 200 || (encoding !== '' && encoding !== 'identity') || !isScriptResponse(proxyRes)) {
-        if (encoding !== '' && encoding !== 'identity') {
-          log('warn', `force-loopback: 上游响应已压缩 (${encoding})，已按原样透传`);
+      // 非 200 / 不是 JS / 编码不认识 → 原样 pipe，绝不冒险改字节
+      const decodable = encoding === '' || encoding === 'identity'
+        || encoding === 'gzip' || encoding === 'x-gzip'
+        || encoding === 'deflate' || encoding === 'br';
+
+      if (status !== 200 || !isScriptResponse(proxyRes) || !decodable) {
+        if (!decodable) {
+          log('warn', `force-loopback: 无法解码的 content-encoding (${encoding})，已按原样透传`);
         }
         res.writeHead(status, proxyRes.statusMessage, upstreamHeaders);
         proxyRes.pipe(res);
@@ -502,27 +650,60 @@ export function createRelay(options = {}) {
       proxyRes.on('data', (chunk) => chunks.push(chunk));
       proxyRes.on('end', () => {
         const original = Buffer.concat(chunks);
-        const text = original.toString('utf-8');
+
+        let plain;
+        try {
+          plain = decodeBody(original, encoding);
+        } catch (err) {
+          // 解压失败极罕见（上游给了错的 encoding）：透传原字节，别把页面弄坏
+          log('warn', `force-loopback: 解压失败（${encoding}），按原样透传：${err?.message || err}`);
+          res.writeHead(status, proxyRes.statusMessage, upstreamHeaders);
+          res.end(original);
+          return;
+        }
+        if (plain === null) {
+          res.writeHead(status, proxyRes.statusMessage, upstreamHeaders);
+          res.end(original);
+          return;
+        }
+
+        const text = plain.toString('utf-8');
         const { body, hits } = patchIsLoopback(text);
 
-        if (hits > 0) {
-          patchCount += 1;
-          log('info', `force-loopback: 已改写 ${hits} 处 isLoopback（${original.length} → ${Buffer.byteLength(body, 'utf-8')} 字节）`);
-          delete upstreamHeaders['content-length'];
-          delete upstreamHeaders['transfer-encoding'];
-          upstreamHeaders['content-length'] = Buffer.byteLength(body, 'utf-8');
-          upstreamHeaders['cache-control'] = 'no-store';   // 避免跨版本缓存混乱
-          res.writeHead(200, upstreamHeaders);
-          res.end(body);
-        } else {
+        if (hits === 0) {
+          // 白名单里但这次没有该字段（dsh 改了实现）：原字节透传，最安全
           patchMisses += 1;
           if (patchMisses <= 3) {
             log('warn', `force-loopback: 该脚本里没有 isLoopback 字段（${req.url}），按原样转发`);
           }
-          // 没命中多半是「这个脚本本来就不含该字段」，属正常；保留原字节。
           res.writeHead(status, proxyRes.statusMessage, upstreamHeaders);
           res.end(original);
+          return;
         }
+
+        patchCount += 1;
+        const patchedBuf = Buffer.from(body, 'utf-8');
+
+        // 原样压回去：浏览器已经声明支持这个编码，压缩后体积才不回退
+        let outBuf;
+        try {
+          outBuf = encodeBody(patchedBuf, encoding);
+        } catch (err) {
+          log('warn', `force-loopback: 重压失败（${encoding}），改发未压缩：${err?.message || err}`);
+          outBuf = patchedBuf;
+          delete upstreamHeaders['content-encoding'];
+        }
+
+        delete upstreamHeaders['transfer-encoding'];
+        upstreamHeaders['content-length'] = outBuf.length;
+        // 关键修复：**保留上游的强缓存语义**，不要再写 no-store。
+        // combo URL 带 rev=<hash>，改写结果由 (rev, 输入字节) 唯一确定。
+        if (upstreamHeaders['cache-control'] === undefined) {
+          upstreamHeaders['cache-control'] = 'public, max-age=31536000, immutable';
+        }
+        log('info', `force-loopback: 已改写 ${hits} 处 isLoopback（明文 ${plain.length} → ${Buffer.byteLength(body, 'utf-8')} 字节，${encoding || 'identity'} 传输 ${original.length} → ${outBuf.length} 字节）`);
+        res.writeHead(200, upstreamHeaders);
+        res.end(outBuf);
       });
       proxyRes.on('error', () => res.destroy());
     });
@@ -577,7 +758,7 @@ export function createRelay(options = {}) {
       method: req.method,
       path: req.url,
       headers,
-      agent: false,
+      agent: ensureAgent(),
     });
     const timer = setTimeout(
       () => proxyReq.destroy(new Error('upstream connect timeout')),
@@ -638,17 +819,12 @@ export function createRelay(options = {}) {
       return forwardTokenExchange(req, res, TARGET);
     }
 
-    // force-loopback 只对客户端脚本生效。先按「探针」方式发一次上游是浪费，
-    // 所以这里用路径前缀粗筛：/plugins/ 之下才可能是客户端 bundle。
-    // 真正的判定仍在响应侧用 content-type 做，避免误缓冲 SSE（/plugins/events）。
-    let pathname = '/';
-    try {
-      pathname = new URL(req.url ?? '/', 'http://x').pathname;
-    } catch {
-      pathname = '/';
-    }
-    const possiblyScript = c.forceLoopback && pathname.startsWith(PLUGIN_ROUTE_PREFIX);
-    if (possiblyScript) return handlePatchedScript(req, res, TARGET, c);
+    // force-loopback 只对**白名单包**的客户端 bundle 生效（见
+    // LOOPBACK_PATCH_PACKAGES）。其余 `/plugins/` 请求按普通代理透传 ——
+    // 保留 dsh 的 gzip 与强缓存，这是启动流量不膨胀的关键。
+    const patchTarget = c.forceLoopback && isLoopbackPatchTarget(req.url ?? '');
+    if (patchTarget) return handlePatchedScript(req, res, TARGET, c);
+    if (String(req.url ?? '').startsWith(PLUGIN_ROUTE_PREFIX)) passthroughCount += 1;
 
     const headers = prepareForwardHeaders(req, false, TARGET, c);
     const proxyReq = http.request({
@@ -657,7 +833,7 @@ export function createRelay(options = {}) {
       method: req.method,
       path: req.url,
       headers,
-      agent: false,
+      agent: ensureAgent(),
     });
     const timer = setTimeout(() => proxyReq.destroy(new Error('upstream connect timeout')), UPSTREAM_CONNECT_TIMEOUT_MS);
 
@@ -694,6 +870,8 @@ export function createRelay(options = {}) {
 
     const TARGET = target();
     // WebSocket 也要补签：dsh 的 RPC 下行流与事件推送都走 upgrade。
+    // 这里**刻意**不复用 upstreamAgent：升级后的连接会一直持有 socket，
+    // 放进连接池只会占住名额。
     const headers = prepareForwardHeaders(req, true, TARGET, c);
     const proxyReq = http.request({
       hostname: TARGET.hostname,
@@ -866,6 +1044,13 @@ export function createRelay(options = {}) {
           }
         }
         liveSockets.clear();
+        // 释放上游连接池：否则 keep-alive 的空闲 socket 会一直挂着，
+        // 停用后仍占着到 dsh 的连接。
+        try {
+          upstreamAgent.destroy();
+        } catch {
+          /* 已释放 */
+        }
         server = null;
         running = false;
         stopping = false;
@@ -918,6 +1103,7 @@ export function createRelay(options = {}) {
       requests: requestCount,
       patchedScripts: patchCount,
       patchMisses,
+      passthroughScripts: passthroughCount,
       startedAt: running ? startedAt : null,
       uptimeMs: running ? Date.now() - startedAt : 0,
       lastError,

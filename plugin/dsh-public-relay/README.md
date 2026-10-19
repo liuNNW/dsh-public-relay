@@ -77,7 +77,7 @@ dsh plugin --profile <profile> add dsh-public-relay
 ### 自检 / 清理
 
 ```powershell
-# 自检：manifest 兼容性 + 所有 lib/*.js 语法 + 五套测试（共 235 项断言）
+# 自检：manifest 兼容性 + 所有 lib/*.js 语法 + 五套测试（共 244 项断言）
 powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Check
 
 # 尝试用官方 CLI 安装
@@ -233,9 +233,9 @@ Windows PowerShell 5.1 按系统 ANSI 代码页读无 BOM 脚本，而本脚本�
 ## 开发
 
 ```powershell
-# 四套测试
-node plugin\tests\smoke.mjs              # 中转核心 63 项
-node plugin\tests\host-integration.mjs   # 宿主半 53 项
+# 五套测试（共 244 项断言）
+node plugin\tests\smoke.mjs              # 中转核心 72 项
+node plugin\tests\host-integration.mjs   # 宿主半   53 项
 node plugin\tests\client-half.mjs        # 浏览器半 62 项
 node plugin\tests\dsh-session.spec.mjs   # 会话代签 52 项
 node plugin\tests\password-modes.mjs     # 口令模式  5 项
@@ -248,6 +248,35 @@ node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" grep "<正则>" [�
 node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" ls  [路径前缀]
 node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" cat <内部路径>
 ```
+
+### 性能探针（公网访问调优用）
+
+三个脚本都直连真实 dsh + 真实中转，输出可核对的数字：
+
+```powershell
+# 启动流量放大倍率：直连 gzip vs 经中转，逐 bundle 对比
+#   修复前 2.55x（10.29 MB → 26.18 MB），修复后应为 1.00x
+node plugin\tools\analyze-relay-payload.mjs
+
+# WebSocket 长连接稳定性 + 心跳间隔是否已放宽
+#   40s 窗口内默认应为 ~20 个 Ping；放宽到 15000ms 后应只有 2–3 个
+node plugin\tools\probe-ws-stability.mjs 40000
+
+# 单个会话的「首屏历史」到底多大（按帧解 zstd，含 50/200/500 条三档）
+node plugin\tools\probe-session-size.mjs [会话 .jsonl.zstd 路径]
+```
+
+### 公网访问调优的三处改动（0.2.1 起）
+
+| 问题 | 实测 | 改法 |
+| --- | --- | --- |
+| 中转对**所有** `/plugins/` 强制 `identity` 并缓冲 | 85 个 bundle 全被解压重传，10.29 MB → 26.18 MB（**2.55x**） | 只对白名单包 `@deepseek-ai/dsh-client-connection` 改写，其余透传 |
+| 改写后写死 `no-store`，丢掉强缓存 | 直连 `max-age=31536000, immutable` → 经中转 `no-store` | 保留上游缓存头（combo URL 自带 `rev=<hash>`，天然可缓存） |
+| 每请求 `agent: false`，上一跳不复用 | TIME_WAIT 随请求数线性堆积 | 统一 `http.Agent({ keepAlive: true })`（WS upgrade 仍不复用） |
+
+> 第四处（dsh 心跳窗口）不在本包里，改的是 profile 的 `cordis.patch.yml`：
+> `typert-gateway` 的 `websocketHeartbeatIntervalMs` 从默认 2000 调到 15000。
+> dsh 漏 2 次心跳就 `terminate()`，默认容忍窗口只有 4–6 秒，跨公网隧道必然抖断。
 
 ### 0.2.0 改了什么
 

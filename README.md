@@ -151,7 +151,7 @@ plugin/
     locale/{zh,en}.json          插件列表展示元数据
   install.ps1                    自检 / 安装指引 / 旧安装残留清理
   tools/                         诊断与开发工具
-  tests/                         五套测试（235 项断言）
+  tests/                         五套测试（244 项断言）
 ```
 
 ---
@@ -160,7 +160,7 @@ plugin/
 
 ```powershell
 # 五套测试
-node plugin\tests\smoke.mjs              # 中转核心      63 项
+node plugin\tests\smoke.mjs              # 中转核心      72 项
 node plugin\tests\host-integration.mjs   # 宿主半        53 项
 node plugin\tests\client-half.mjs        # 浏览器半      62 项
 node plugin\tests\dsh-session.spec.mjs   # 会话代签      52 项
@@ -257,7 +257,7 @@ Windows PowerShell 5.1 按系统 ANSI 代码页读无 BOM 脚本，而本脚本�
 
 优化：
 - 行为 / 性能 / 可维护性上的实际变化
-- 附上验证结果（例：node plugin\tests\smoke.mjs 63 项全绿）
+- 附上验证结果（例：node plugin\tests\smoke.mjs 72 项全绿）
 - 没有实质优化就写「无」
 ```
 

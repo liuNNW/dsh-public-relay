@@ -12,7 +12,8 @@
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createRelay, patchIsLoopback } from '../dsh-public-relay/lib/relay.js';
+import zlib from 'node:zlib';
+import { createRelay, patchIsLoopback, isLoopbackPatchTarget } from '../dsh-public-relay/lib/relay.js';
 import { normalizeConfig, DEFAULTS } from '../dsh-public-relay/lib/config.js';
 
 // ── 整体超时保险 ──
@@ -145,9 +146,34 @@ function startUpstream() {
       return;
     }
 
-    if (req.url === '/plugins/@deepseek-ai/dsh-client-connection/client.js') {
-      res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' });
-      res.end(bundleSource);
+    if (req.url === '/plugins/??@deepseek-ai/dsh-client-connection/client.js&rev=aaa') {
+      // 模拟 dsh 的真实行为：声明了 gzip 就压着回来，并给强缓存头。
+      // 中转必须「解压 → 改写 → 按原编码压回」，且保留缓存语义。
+      const accept = String(req.headers['accept-encoding'] || '');
+      const wantsGzip = accept.includes('gzip');
+      const body = wantsGzip ? zlib.gzipSync(bundleSource) : Buffer.from(bundleSource);
+      res.writeHead(200, {
+        'content-type': 'text/javascript; charset=utf-8',
+        'cache-control': 'public, max-age=31536000, immutable',
+        ...(wantsGzip ? { 'content-encoding': 'gzip' } : {}),
+        'content-length': body.length,
+      });
+      res.end(body);
+      return;
+    }
+    // 白名单之外的同形状 bundle：必须原样透传（保持 gzip、不被缓冲）
+    if (req.url === '/plugins/??@deepseek-ai/dsh-client-ui-chat/client.js&rev=bbb') {
+      const accept = String(req.headers['accept-encoding'] || '');
+      const wantsGzip = accept.includes('gzip');
+      const payload = 'export const chat = 1; // isLoopback: not really\n'.repeat(2000);
+      const body = wantsGzip ? zlib.gzipSync(payload) : Buffer.from(payload);
+      res.writeHead(200, {
+        'content-type': 'text/javascript; charset=utf-8',
+        'cache-control': 'public, max-age=31536000, immutable',
+        ...(wantsGzip ? { 'content-encoding': 'gzip' } : {}),
+        'content-length': body.length,
+      });
+      res.end(body);
       return;
     }
     if (req.url === '/api/ping') {
@@ -399,24 +425,64 @@ async function main() {
       check('上游看到的 Origin 被改写为同权威', body.origin === `http://127.0.0.1:${upstream.port}`, `got ${body.origin}`);
     }
 
-    section('force-loopback bundle 改写');
+    section('force-loopback 改写（目标集 + 压缩保持）');
     {
-      const r = await request(relayPort, '/plugins/@deepseek-ai/dsh-client-connection/client.js', { headers: { cookie } });
-      const text = r.body.toString();
-      check('返回 200', r.status === 200, `got ${r.status}`);
-      check('isLoopback 被改成 true', text.includes('isLoopback: true'), text.slice(0, 200));
-      check('原判定式已不存在', !text.includes('isLoopbackHostname(pageLocation.hostname)'), text.slice(0, 200));
-      check('content-length 等于新体字节数',
-        Number(r.headers['content-length']) === Buffer.byteLength(text, 'utf-8'),
-        `header=${r.headers['content-length']} actual=${Buffer.byteLength(text, 'utf-8')}`);
-      check('改写后禁用缓存', r.headers['cache-control'] === 'no-store', `got ${r.headers['cache-control']}`);
+      const TARGET_URL = '/plugins/??@deepseek-ai/dsh-client-connection/client.js&rev=aaa';
+      const OTHER_URL = '/plugins/??@deepseek-ai/dsh-client-ui-chat/client.js&rev=bbb';
 
-      // 关闭 force-loopback 后应按原样透传
+      // ── 目标集判定本身 ──
+      check('isLoopbackPatchTarget 命中白名单包', isLoopbackPatchTarget(TARGET_URL) === true,
+        `got ${isLoopbackPatchTarget(TARGET_URL)}`);
+      check('isLoopbackPatchTarget 放过非白名单包', isLoopbackPatchTarget(OTHER_URL) === false,
+        `got ${isLoopbackPatchTarget(OTHER_URL)}`);
+      check('isLoopbackPatchTarget 不误命中 SSE 路径', isLoopbackPatchTarget('/plugins/events') === false,
+        `got ${isLoopbackPatchTarget('/plugins/events')}`);
+      check('isLoopbackPatchTarget 命中批量 combo 里的白名单包',
+        isLoopbackPatchTarget('/plugins/??a/client.js,@deepseek-ai/dsh-client-connection/client.js&rev=c') === true,
+        'mixed combo not matched');
+
+      // ── 目标包：解压 → 改写 → 按原编码压回，且保留强缓存 ──
+      const r = await request(relayPort, TARGET_URL, {
+        headers: { cookie, 'accept-encoding': 'gzip' },
+      });
+      check('目标包返回 200', r.status === 200, `got ${r.status}`);
+      check('目标包仍以 gzip 传输（没有被降级成明文）',
+        String(r.headers['content-encoding'] || '') === 'gzip',
+        `got ${r.headers['content-encoding']}`);
+      const decoded = zlib.gunzipSync(r.body).toString('utf-8');
+      check('解压后 isLoopback 被改成 true', decoded.includes('isLoopback: true'), decoded.slice(0, 200));
+      check('原判定式已不存在', !decoded.includes('isLoopbackHostname(pageLocation.hostname)'), decoded.slice(0, 200));
+      check('content-length 等于压缩后字节数',
+        Number(r.headers['content-length']) === r.body.length,
+        `header=${r.headers['content-length']} actual=${r.body.length}`);
+      check('保留上游强缓存（不再强制 no-store）',
+        String(r.headers['cache-control'] || '').includes('immutable'),
+        `got ${r.headers['cache-control']}`);
+
+      // ── 非目标包：必须原样透传，压缩不被绕过 ──
+      const rOther = await request(relayPort, OTHER_URL, {
+        headers: { cookie, 'accept-encoding': 'gzip' },
+      });
+      check('非目标包返回 200', rOther.status === 200, `got ${rOther.status}`);
+      check('非目标包保持 gzip（这是启动流量不膨胀的关键）',
+        String(rOther.headers['content-encoding'] || '') === 'gzip',
+        `got ${rOther.headers['content-encoding']}`);
+      check('非目标包字节数与上游一致（没有解压重传）',
+        rOther.body.length === Number(rOther.headers['content-length'] || rOther.body.length),
+        `body=${rOther.body.length}`);
+      check('非目标包保留强缓存',
+        String(rOther.headers['cache-control'] || '').includes('immutable'),
+        `got ${rOther.headers['cache-control']}`);
+
+      // 关闭 force-loopback 后目标包也应按原样透传
       config = { ...config, forceLoopback: false };
-      const r2 = await request(relayPort, '/plugins/@deepseek-ai/dsh-client-connection/client.js', { headers: { cookie } });
+      const r2 = await request(relayPort, TARGET_URL, {
+        headers: { cookie, 'accept-encoding': 'gzip' },
+      });
+      const decoded2 = zlib.gunzipSync(r2.body).toString('utf-8');
       check('forceLoopback=false 时原样透传',
-        r2.body.toString().includes('isLoopbackHostname(pageLocation.hostname)'),
-        r2.body.toString().slice(0, 200));
+        decoded2.includes('isLoopbackHostname(pageLocation.hostname)'),
+        decoded2.slice(0, 200));
       config = { ...config, forceLoopback: true };
     }
 
