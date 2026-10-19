@@ -21,6 +21,13 @@
  *   · 删除「令牌交换单独转发」分支：它与统一转发相互矛盾，而且现在不再需要
  *     （见 prepareForwardHeaders 的说明）。令牌交换按普通请求转发即可。
  *   · 上游端口始终从宿主的 webServer 热读，不写死 3080/19387。
+ *
+ * 0.2.3 相对 0.2.x 的实质改动：
+ *   · 认证原语（makeAuth / verifyToken / parseCookies / LOGIN_PAGE / 登录限流）
+ *     迁到 lib/auth.js —— 管理路由的鉴权要与中转共用同一套凭据，而
+ *     `isLoopbackPeer` 需要被 index.js 与本文件共用，集中才不会漂移。
+ *   · 登录限流取键不再采信可伪造的 X-Forwarded-For 第一项（见 auth.js）。
+ *   · 限流表从模块级单例改为实例内状态。
  */
 'use strict';
 
@@ -29,6 +36,22 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import os from 'node:os';
 
+import {
+  createLoginLimiter,
+  isLoopbackPeer,
+  loginKeyOf,
+  makeAuth,
+  LOGIN_PAGE,
+  LOGIN_WINDOW_MS,
+} from './auth.js';
+import { isLoopbackTargetHost, LOOPBACK_TARGET_HOSTS } from './config.js';
+
+/**
+ * 兼容性再导出：这些符号原先由本文件定义，测试与其它调用方仍从
+ * `lib/relay.js` 引入。实现已迁到 lib/auth.js。
+ */
+export { makeAuth, loginKeyOf, isLoopbackPeer, LOGIN_PAGE };
+
 // ─────────────────────────── 常量 ───────────────────────────
 
 /** hop-by-hop 头：逐跳语义不能透传；upgrade 场景单独保留 connection/upgrade。 */
@@ -36,6 +59,32 @@ const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-connection', 'te', 'trail
 
 const UPSTREAM_CONNECT_TIMEOUT_MS = 15000;
 const STOP_DRAIN_TIMEOUT_MS = 2000;
+
+/**
+ * 单个改写目标脚本允许缓冲的**压缩后**字节上限。
+ *
+ * handlePatchedScript 必须把整个响应读进内存才能做结构化改写（要按括号深度
+ * 扫出 isLoopback 的值表达式），所以这里天然需要一个上限，否则一个超大响应
+ * 就能把中转进程的内存吃光。白名单内的目标只有 dsh-client-connection 的
+ * combo 产物（实测 10 MB 量级），32 MiB 给了三倍余量。
+ *
+ * 超限的处理：立刻销毁上游响应并回 502，**不把已缓冲的字节往 res 写** ——
+ * 那时还没 writeHead，写出去就是半个响应体，浏览器只会看到一个损坏的脚本。
+ */
+const MAX_PATCH_BYTES = 32 * 1024 * 1024;
+
+/**
+ * 解压/压缩时允许产出的**明文**字节上限。
+ *
+ * 压缩炸弹的形态就是「压缩后很小、解压后巨大」，而 decodeBody 的产物是要
+ * 整份转成字符串再扫描的。给到 64 MiB：比 MAX_PATCH_BYTES 宽裕（压缩后的
+ * 32 MiB 理论上能解出远大于自身的内容），但仍是有限的。
+ *
+ * 注意这条上限**故意不做到「永不触发」**：触发时 zlib 抛错，调用点的 catch
+ * 分支会把上游原字节原样透传 —— 页面照常工作，只是这次没做 isLoopback 改写。
+ * 这是刻意的降级，不是错误。
+ */
+const MAX_DECODED_BYTES = 64 * 1024 * 1024;
 
 /** 需要改写的客户端资源前缀（client-modules 的 bundle 路由）。 */
 const PLUGIN_ROUTE_PREFIX = '/plugins/';
@@ -78,6 +127,22 @@ const WS_DEFLATE_OPTIONS = {
   clientNoContextTakeover: true,
 };
 
+/**
+ * WS 下行背压阈值（字节）。
+ *
+ * `WebSocket#bufferedAmount` = 「已进发送队列、尚未写完 socket」的字节数。
+ * 它**不随单帧大小跳变**，只反映对端读得有多慢：正常客户端的 TCP 窗口远大于
+ * 此值，单帧在下一帧到达前通常已写空，稳态下这个数很小。
+ *
+ * 为什么是 8 MiB：dsh 的历史快照单帧实测 4~6.6 MB。8 MiB 给单帧留了约
+ * 1.2~1.7 倍余量，所以**正常的 4~6 MB 历史帧不会被误伤**；而一旦它真的涨到
+ * 8 MiB，说明客户端已经卡死或链路停滞，此时继续排队只会让内存无界增长，
+ * 断连是唯一正确的选择。
+ *
+ * 与 `maxPayload`（64 MB）的分工：maxPayload 挡**单帧**上限，这里管**累计**。
+ */
+const WS_DOWNLINK_BACKPRESSURE_LIMIT = 8 * 1024 * 1024;
+
 // ─────────────────────────── 头部工具 ───────────────────────────
 
 /** 改写 Host/Origin 为上游回环权威，过 dsh 的信任栅栏；剥离 hop-by-hop 头。 */
@@ -99,11 +164,29 @@ export function stripHopByHop(headers) {
   return h;
 }
 
+/**
+ * 把 header 表序列化成 HTTP 头文本（用于手写的 101 / 错误响应）。
+ *
+ * **必须过滤 CR/LF**：这些值来自上游（`proxyRes.headers`），而上游可能是
+ * 任何东西。头值里混进 `\r\n` 就等于往我们手写的响应里注入新头/新响应，
+ * 即经典的 HTTP response splitting。
+ *
+ * （正常路径走 `res.writeHead()` 时由 Node 自己校验，但 101 与错误响应是
+ * 我们拼字符串写的，Node 管不到。）
+ *
+ * @param headers - 头表
+ * @returns 可直接拼进响应头的文本
+ */
 export function serializeHeaders(headers) {
+  /** 去掉一切可能截断头的字符。 */
+  const clean = (v) => String(v).replace(/[\r\n\0]/g, ' ');
   let out = '';
   for (const [k, v] of Object.entries(headers)) {
     if (v === undefined || v === null) continue;
-    for (const val of Array.isArray(v) ? v : [v]) out += `${k}: ${val}\r\n`;
+    const name = clean(k);
+    // 头名不能含冒号/空白，否则同样能造出新头
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) continue;
+    for (const val of Array.isArray(v) ? v : [v]) out += `${name}: ${clean(val)}\r\n`;
   }
   return out;
 }
@@ -127,8 +210,11 @@ export function resolveTarget(host, port) {
 /**
  * 从一个表达式起点找出它的结束位置（不含结束符）。
  *
- * 规则：维护 `()[]{}` 深度；跳过字符串字面量；深度为 0 时遇到 `,` `;` `)`
- * `}` 或换行即结束。追踪到越界或深度变负则判定失败（返回 -1）。
+ * 规则：维护 `()[]{}` 深度；跳过字符串字面量与注释；深度为 0 时遇到
+ * `,` `;` `)` `}` 或换行即结束。越界或深度变负则判定失败（返回 -1）。
+ *
+ * 注释必须跳过：否则 `isLoopback: foo /* } *​/` 这类值会让深度算错，
+ * 进而把后半段代码一起吞掉，产出语法错误的 JS（整包白屏）。
  *
  * @param source - 整段脚本
  * @param start - 值表达式的第一个字符位置
@@ -139,6 +225,20 @@ function scanExpressionEnd(source, start) {
   let i = start;
   while (i < source.length) {
     const ch = source[i];
+    const next = source[i + 1];
+    // 行注释：跳过后面的全部内容，注释里的括号不算深度
+    if (ch === '/' && next === '/') {
+      i += 2;
+      while (i < source.length && source[i] !== '\n') i += 1;
+      continue;
+    }
+    // 块注释：同上
+    if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i += 1;
+      i += 2;
+      continue;
+    }
     if (ch === '"' || ch === "'" || ch === '`') {
       const quote = ch;
       i += 1;
@@ -164,21 +264,76 @@ function scanExpressionEnd(source, start) {
 }
 
 /**
+ * 判断某个偏移是否落在字符串 / 注释 / 正则字面量里。
+ *
+ * 只用来**排除**误命中，不需要完整词法分析：从脚本开头线性扫一遍，
+ * 维护「我在不在字面量里」即可。命中位置在字面量里就跳过。
+ *
+ * @param source - 整段脚本
+ * @returns (index: number) => boolean，true 表示该位置在字面量或注释内
+ */
+function makeLiteralMask(source) {
+  const len = source.length;
+  /** 每段字面量/注释的 [start, end) 区间 */
+  const ranges = [];
+  let i = 0;
+  while (i < len) {
+    const ch = source[i];
+    const next = source[i + 1];
+    if (ch === '/' && next === '/') {
+      const start = i;
+      i += 2;
+      while (i < len && source[i] !== '\n') i += 1;
+      ranges.push([start, i]);
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      const start = i;
+      i += 2;
+      while (i < len && !(source[i] === '*' && source[i + 1] === '/')) i += 1;
+      i = Math.min(len, i + 2);
+      ranges.push([start, i]);
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const start = i;
+      const quote = ch;
+      i += 1;
+      while (i < len) {
+        if (source[i] === '\\') { i += 2; continue; }
+        if (source[i] === quote) { i += 1; break; }
+        i += 1;
+      }
+      ranges.push([start, i]);
+      continue;
+    }
+    i += 1;
+  }
+  return (index) => ranges.some(([start, end]) => index >= start && index < end);
+}
+
+/**
  * 找出脚本里所有 `isLoopback: <expr>` 的可替换片段。
  *
- * 只认「键名后跟冒号」的位置，并且要求值表达式里出现 isLoopback / ownsHost /
- * pageLocation 之一 —— 两道闸门保证不会误改无关代码。
+ * 四道闸门，缺一不可：
+ *   ① 键名必须是 `isLoopback:`；
+ *   ② 前一个字符必须是 `{` `,` `(` 或空白（对象字面量键的形态）；
+ *   ③ 命中位置**不能落在字符串/注释里**（否则会把注释里的说明文字当代码改，
+ *      实测会产出语法错误的 JS）；
+ *   ④ 值表达式里必须出现 isLoopback / ownsHost / pageLocation 之一。
  *
  * @param source - 客户端脚本
  * @returns `[start, end)` 区间数组（区间内容可整体替换）
  */
 export function findIsLoopbackSpans(source) {
   const KEY = 'isLoopback:';
+  const inLiteral = makeLiteralMask(source);
   const spans = [];
   let cursor = 0;
   for (;;) {
     const at = source.indexOf(KEY, cursor);
     if (at < 0) break;
+    if (inLiteral(at)) { cursor = at + KEY.length; continue; }
     const prev = at === 0 ? '' : source[at - 1];
     // 只接受「对象字面量里的键」这一种形态
     if (at !== 0 && !/[{,(\s]/.test(prev)) { cursor = at + KEY.length; continue; }
@@ -264,11 +419,14 @@ export function decodeBody(buffer, encoding) {
       return buffer;
     case 'gzip':
     case 'x-gzip':
-      return zlib.gunzipSync(buffer);
+      return zlib.gunzipSync(buffer, { maxOutputLength: MAX_DECODED_BYTES });
     case 'deflate':
-      return zlib.inflateSync(buffer);
+      return zlib.inflateSync(buffer, { maxOutputLength: MAX_DECODED_BYTES });
     case 'br':
-      return zlib.brotliDecompressSync(buffer);
+      return zlib.brotliDecompressSync(buffer, {
+        params: { [zlib.constants.BROTLI_PARAM_SIZE_HINT]: buffer.length },
+        maxOutputLength: MAX_DECODED_BYTES,
+      });
     default:
       return null;
   }
@@ -291,9 +449,9 @@ export function encodeBody(buffer, encoding) {
       return buffer;
     case 'gzip':
     case 'x-gzip':
-      return zlib.gzipSync(buffer, { level: 1 });
+      return zlib.gzipSync(buffer, { level: 1, maxOutputLength: MAX_DECODED_BYTES });
     case 'deflate':
-      return zlib.deflateSync(buffer, { level: 1 });
+      return zlib.deflateSync(buffer, { level: 1, maxOutputLength: MAX_DECODED_BYTES });
     case 'br':
       return zlib.brotliCompressSync(buffer, {
         params: {
@@ -307,100 +465,45 @@ export function encodeBody(buffer, encoding) {
 }
 
 // ─────────────────────────── 口令认证 ───────────────────────────
-
-/** HMAC-SHA256 签名 Cookie 会话；空口令返回 null（关闭认证）。 */
-export function makeAuth(password) {
-  if (!password) return null;
-  const secret = crypto.createHmac('sha256', 'dsh-public-relay').update(password).digest();
-  const cookieName = 'relay_session';
-  const COOKIE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
-
-  function signToken(exp) {
-    const payload = Buffer.from(JSON.stringify({ exp })).toString('base64url');
-    const sig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
-    return `${payload}.${sig}`;
-  }
-
-  function verifyToken(token) {
-    if (typeof token !== 'string') return false;
-    const dot = token.indexOf('.');
-    if (dot <= 0) return false;
-    const payload = token.slice(0, dot);
-    const sig = token.slice(dot + 1);
-    const expected = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
-    const a = Buffer.from(sig);
-    const b = Buffer.from(expected);
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
-    try {
-      const { exp } = JSON.parse(Buffer.from(payload, 'base64url').toString());
-      return typeof exp === 'number' && exp > Date.now();
-    } catch {
-      return false;
-    }
-  }
-
-  function parseCookies(req) {
-    const out = {};
-    const raw = req.headers.cookie;
-    if (!raw) return out;
-    for (const part of raw.split(';')) {
-      const eq = part.indexOf('=');
-      if (eq <= 0) continue;
-      try {
-        out[decodeURIComponent(part.slice(0, eq).trim())] = decodeURIComponent(part.slice(eq + 1).trim());
-      } catch {
-        /* 忽略非法 cookie */
-      }
-    }
-    return out;
-  }
-
-  return { cookieName, signToken, verifyToken, parseCookies, COOKIE_TTL_MS, LOGIN_PAGE };
-}
-
-const LOGIN_PAGE = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dsh-public-relay 登录</title>
-<style>
-  body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#0f1115;color:#e6e6e6;
-       display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-  .card{background:#1a1d24;border:1px solid #2c313c;border-radius:12px;padding:32px;width:320px}
-  h1{font-size:18px;margin:0 0 4px} p{color:#9aa3b2;font-size:13px;margin:0 0 20px}
-  input{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #3a4150;
-        background:#12141a;color:#e6e6e6;font-size:14px}
-  button{margin-top:14px;width:100%;padding:10px;border:0;border-radius:8px;background:#3b82f6;
-         color:#fff;font-size:14px;cursor:pointer}
-  button:hover{background:#2f6fe0}
-  .err{color:#f87171;font-size:13px;margin-top:10px}
-</style>
-</head>
-<body>
-  <form class="card" method="post" action="/__login">
-    <h1>dsh-public-relay 访问口令</h1>
-    <p>请输入启动时设置的口令以继续</p>
-    <input type="password" name="password" placeholder="口令" autocomplete="off" autofocus required>
-    <button type="submit">进入</button>
-    __ERR__
-  </form>
-</body>
-</html>`;
+//
+// makeAuth / LOGIN_PAGE 已迁到 lib/auth.js（见文件头的兼容性再导出）。
 
 /**
  * 判断这是否是 dsh 自己的启动令牌交换请求（`GET /?token=…`）。
  *
+ * ── 安全边界（0.2.2 修复）──
+ *
  * 这类请求必须**原样**到达 dsh：token 是一次性凭据，被中转的登录页吃掉就
- * 再也换不出会话 Cookie。它不是越权入口 —— token 本身就是凭证。
+ * 再也换不出会话 Cookie。所以它需要绕过中转自己的口令页。
+ *
+ * **但绕过必须严格限定在 dsh 真正处理它的那一个请求上**，否则等于开了一个
+ * 万能后门。dsh 的 `authorizeIndex` 只在下面这个形状里接受 token：
+ *
+ *     GET /?token=<唯一一个 token>      ← pathname 必须是 "/"，且 token 恰好一个
+ *     GET /?token=…&…                  ← 其它 pathname 一律 401，不认 token
+ *
+ * 因此这里逐条对齐，任何一条不满足就不算令牌交换（请求会继续走口令认证）：
+ *
+ *   · method 必须是 GET
+ *   · **pathname 必须是 `/`** —— 这是最关键的约束。旧实现只看「有没有 token
+ *     参数」，于是 `GET /api/any?token=x` 也能免口令直达 dsh；叠加 autoSession
+ *     的代签后，未认证攻击者能拿到完整的 dsh 会话（已实测复现）。
+ *   · token 必须恰好一个、且非空
+ *
+ * @param req - 入站请求
+ * @returns true 表示这是 dsh 的启动令牌交换，应原样放行
  */
 function isDshTokenExchange(req) {
   if (req.method !== 'GET') return false;
+  let url;
   try {
-    return new URL(req.url, 'http://placeholder').searchParams.has('token');
+    url = new URL(req.url, 'http://placeholder');
   } catch {
     return false;
   }
+  if (url.pathname !== '/') return false;
+  const tokens = url.searchParams.getAll('token');
+  return tokens.length === 1 && tokens[0] !== '';
 }
 
 /**
@@ -419,15 +522,51 @@ function wantsLoginPage(req) {
 }
 
 /**
+ * 浏览器到中转这一段是否走 TLS。
+ *
+ * 中转自己通常是明文 HTTP（监听 127.0.0.1，由隧道终结 TLS），所以不能只看
+ * `socket.encrypted`。优先看反向代理常见的 `x-forwarded-proto`，再看本连接
+ * 是否是 TLS socket。两者都没有就判明文 —— 此时不加 Secure，否则浏览器
+ * 根本不会回传 Cookie，用户会陷入「登录成功但立刻又要求登录」的死循环。
+ *
+ * @param req - 入站请求
+ * @returns 是否按 HTTPS 处理
+ */
+function isSecureRequest(req) {
+  const forwarded = req.headers['x-forwarded-proto'];
+  const proto = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  if (typeof proto === 'string' && proto.split(',')[0].trim().toLowerCase() === 'https') return true;
+  return req.socket !== undefined && req.socket.encrypted === true;
+}
+
+/**
+ * 登录尝试限速（按来源 IP）。
+ *
+ * 取键规则、阈值常量与限流表都在 auth.js（`loginKeyOf` /
+ * `createLoginLimiter`）：取键必须与 index.js 的 `isLoopbackPeer` 共享同一套
+ * 「只信 socket、对端非回环就忽略 XFF」的规则，两处各写一份必然漂移。表本身
+ * 由 createRelay **按实例**创建 —— 模块级单例会互相污染同一进程里的其它
+ * relay 实例，测试之间也会串味。
+ *
+ * 为什么必须有：口令是这个公网面上**唯一**的边界，而失败的 400ms 延时只是
+ * 拖慢单条连接，攻击者开 N 条并发就摊平了。滑动窗口才是真正的屏障。
+ *
+ * 说明：这是进程内状态，重启即清零；对「拖慢在线爆破」足够，不是对抗分布式
+ * 攻击的方案（那需要上游/WAF 层）。隧道场景下同链客户端共享一个键，限流偏严。
+ */
+
+/**
  * 认证入口：未登录时返回登录页 / 401；处理 POST /__login。
+ * @param limiter - 实例级登录限流表（createLoginLimiter 的返回值）
  * @returns true 表示已放行，false 表示本函数已接管响应。
  */
-function authGate(req, res, socket, auth, password, log) {
+function authGate(req, res, socket, auth, password, log, limiter) {
   if (!auth) return true;
 
   // dsh 的启动令牌交换优先放行（见 isDshTokenExchange 注释）。
+  // 注意：日志里**只记 pathname**，绝不记 query —— 那里面是一次性启动令牌。
   if (isDshTokenExchange(req)) {
-    log?.('info', `放行 dsh 启动令牌交换：${req.url}`);
+    log?.('info', '放行 dsh 启动令牌交换');
     return true;
   }
 
@@ -435,32 +574,61 @@ function authGate(req, res, socket, auth, password, log) {
   if (auth.verifyToken(token)) return true;
 
   if (req.method === 'POST' && req.url === '/__login') {
+    // 限流优先于读 body：被限的请求不该再消耗读取与 hash 的开销
+    if (limiter.isLimited(req)) {
+      log?.('warn', '登录尝试过于频繁，已临时限流');
+      if (res) {
+        res.writeHead(429, {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+          'retry-after': String(Math.ceil(LOGIN_WINDOW_MS / 1000)),
+        });
+        res.end(auth.LOGIN_PAGE.replace('__ERR__', '<div class="err">尝试过于频繁，请稍后再试</div>'));
+      }
+      return false;
+    }
     let body = '';
     let over = false;
+    /** 登录表单上限：口令 + 极少数额外字段足够。 */
+    const LOGIN_BODY_LIMIT = 16 * 1024;
     req.on('data', (chunk) => {
+      if (over) return;              // 已超限：不再继续累积
       body += chunk;
-      if (body.length > 16 * 1024) over = true;
-    });
-    req.on('end', () => {
-      if (over) {
-        if (res) {
+      if (body.length > LOGIN_BODY_LIMIT) {
+        over = true;
+        // 立刻丢弃已收内容并断开 —— 只打标记继续读会让这个**免认证**端点
+        // 成为内存耗尽入口（慢速灌包时 end 可能永远不来）。
+        body = '';
+        if (res && !res.headersSent) {
           res.writeHead(413, { 'content-type': 'text/plain; charset=utf-8' });
           res.end('payload too large');
         }
-        return;
+        req.destroy();
       }
+    });
+    req.on('error', () => { /* 连接被对端打断，无需处理 */ });
+    req.on('end', () => {
+      if (over) return;
       const input = new URLSearchParams(body).get('password') || '';
       const ha = crypto.createHash('sha256').update(input).digest();
       const hb = crypto.createHash('sha256').update(password).digest();
       const ok = crypto.timingSafeEqual(ha, hb);
-      // 失败延时，拖慢暴力破解
+      // 记录失败计数（成功则清零）。必须在延时之外做，否则并发请求
+      // 会在延时窗口里全部「看起来还没失败」，限流形同虚设。
+      if (ok) limiter.clear(req);
+      else limiter.record(req);
+      // 失败延时，拖慢暴力破解（真正的屏障是上面的滑动窗口限流）
       setTimeout(() => {
         if (!res || res.headersSent) return;
         if (ok) {
           const exp = Date.now() + auth.COOKIE_TTL_MS;
+          // 隧道若是 HTTPS（樱花映射的 https 隧道 / 前面的反代做了 TLS），
+          // 就必须带 Secure，否则浏览器可能把 Cookie 也发到明文端口。
+          // 判断依据是浏览器实际用的协议：转发头优先，其次看本连接是否 TLS。
+          const isSecure = isSecureRequest(req);
           res.writeHead(302, {
             location: '/',
-            'set-cookie': `${auth.cookieName}=${auth.signToken(exp)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(auth.COOKIE_TTL_MS / 1000)}`,
+            'set-cookie': `${auth.cookieName}=${auth.signToken(exp)}; Path=/; HttpOnly; SameSite=Lax${isSecure ? '; Secure' : ''}; Max-Age=${Math.floor(auth.COOKIE_TTL_MS / 1000)}`,
             'cache-control': 'no-store',
           });
           res.end();
@@ -475,19 +643,32 @@ function authGate(req, res, socket, auth, password, log) {
     return false;
   }
 
-  if (wantsLoginPage(req)) {
-    if (res) {
+  /*
+   * 未认证时的三条出口。
+   *
+   * 关键点：**upgrade 路径传进来的 res 是 null**。旧实现里的
+   * `if (wantsLoginPage(req)) { if (res) {...} return false; }` 在 res 为 null
+   * 时什么也不写就返回，socket 既不响应也不关闭 —— 而浏览器发起 WebSocket
+   * 握手时默认带 `Accept: text/html`，于是**每个**未认证的 WS 尝试都会漏一个
+   * 永不释放的连接（start() 把它们记在 liveSockets 里），构成免认证的
+   * fd/内存耗尽。所以这里必须保证：无论 res 是否存在，出口都会关闭连接。
+   */
+  if (res) {
+    if (wantsLoginPage(req)) {
       const page = auth.LOGIN_PAGE.replace('__ERR__', '');
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       res.end(page);
+    } else {
+      res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+      res.end('dsh-public-relay: 未登录（需要访问口令）。\n');
     }
     return false;
   }
-  if (res) {
-    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-    res.end('dsh-public-relay: 未登录（需要访问口令）。\n');
-  } else if (socket) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\ndsh-public-relay: 未登录（需要访问口令）');
+  if (socket) {
+    // 裸 socket（upgrade）：一律回 401 并关闭，绝不留悬空连接
+    try {
+      socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\ndsh-public-relay: 未登录（需要访问口令）');
+    } catch { /* 对端已关 */ }
     socket.destroy();
   }
   return false;
@@ -512,7 +693,6 @@ export function createRelay(options = {}) {
   /** @type {Set<import('node:net').Socket>} */
   const liveSockets = new Set();
   let running = false;
-  let stopping = false;
   let startedAt = 0;
   let lastError = null;
   let boundListen = null;
@@ -521,6 +701,15 @@ export function createRelay(options = {}) {
   let patchMisses = 0;
   let passthroughCount = 0;
   let authCache = { password: undefined, auth: null };
+
+  /**
+   * 登录失败表：**本实例私有**。
+   *
+   * 原先是模块级单例，于是同进程里两个 relay 实例（多 profile、或测试并行）
+   * 会共用一张表：一边爆破就能把另一边正常用户的计数顶掉，且测试之间会串味。
+   * 归实例所有后互不影响，实例销毁时随之回收。
+   */
+  const loginLimiter = createLoginLimiter();
 
   /**
    * WebSocket 流量统计。
@@ -574,6 +763,8 @@ export function createRelay(options = {}) {
       // 否则会静默变成 undefined，让下游的开关形同虚设。
       targetHost: c.targetHost || null,
       targetPort: c.targetPort == null ? null : Number(c.targetPort),
+      // 跨主机必须显式知情打开（见 config.js 的 DEFAULTS.allowOffHostTarget）
+      allowOffHostTarget: c.allowOffHostTarget === true,
       password: c.password ?? '',
       forceLoopback: c.forceLoopback !== false,
       autoSession: c.autoSession !== false,
@@ -684,15 +875,40 @@ export function createRelay(options = {}) {
       }
 
       const chunks = [];
-      proxyRes.on('data', (chunk) => chunks.push(chunk));
+      // 显式累计字节数：不靠每次 chunks.reduce 求和 —— 一旦超限就要立刻决断，
+      // 没必要为了算总数把整份响应再遍历一遍。
+      let receivedBytes = 0;
+      let overflowed = false;
+      proxyRes.on('data', (chunk) => {
+        if (overflowed) return;
+        receivedBytes += chunk.length;
+        if (receivedBytes > MAX_PATCH_BYTES) {
+          overflowed = true;
+          chunks.length = 0;          // 丢掉已缓冲字节，别让它们流向 res
+          proxyRes.destroy();         // 停止从上游读取
+          // 此刻还没 writeHead，可以干净地回一个 502；写半个响应体只会让
+          // 浏览器拿到一个截断的脚本，比报错更难排查。
+          if (!res.headersSent) {
+            res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+            res.end(`relay: 上游脚本超过 ${MAX_PATCH_BYTES} 字节上限，已拒绝改写。\n`);
+          } else {
+            res.destroy();
+          }
+          return;
+        }
+        chunks.push(chunk);
+      });
       proxyRes.on('end', () => {
+        if (overflowed) return;
         const original = Buffer.concat(chunks);
 
         let plain;
         try {
           plain = decodeBody(original, encoding);
         } catch (err) {
-          // 解压失败极罕见（上游给了错的 encoding）：透传原字节，别把页面弄坏
+          // 解压失败（上游编码不符，或触到 MAX_DECODED_BYTES）：透传原字节。
+          // 这条路径必须始终可用 —— 它正是 maxOutputLength 生效时的兜底，
+          // 保证「解不动」只降级为「这次不改写」，不会弄坏页面。
           log('warn', `force-loopback: 解压失败（${encoding}），按原样透传：${err?.message || err}`);
           res.writeHead(status, proxyRes.statusMessage, upstreamHeaders);
           res.end(original);
@@ -732,6 +948,15 @@ export function createRelay(options = {}) {
         }
 
         delete upstreamHeaders['transfer-encoding'];
+        // 内容变了，上游那套「按原字节算出来的」校验/长度头全部失效。留着它们
+        // 比删掉更糟：浏览器会拿旧 etag 去条件请求，拿到一个 304 空响应，
+        // 页面于是用了缓存里的旧脚本 —— 表现为改写「时灵时不灵」。
+        delete upstreamHeaders['etag'];
+        delete upstreamHeaders['last-modified'];
+        delete upstreamHeaders['content-md5'];
+        delete upstreamHeaders['content-range'];
+        delete upstreamHeaders['digest'];
+        delete upstreamHeaders['content-digest'];
         upstreamHeaders['content-length'] = outBuf.length;
         // 关键修复：**保留上游的强缓存语义**，不要再写 no-store。
         // combo URL 带 rev=<hash>，改写结果由 (rev, 输入字节) 唯一确定。
@@ -811,7 +1036,9 @@ export function createRelay(options = {}) {
       // 只在还没重试过、且确实是 403/401 时才回退，避免掩盖真实业务错误。
       if (!triedFallback && !retried && (status === 403 || status === 401)) {
         retried = true;
-        log('warn', `令牌交换被上游以 ${status} 拒绝（authority 未受信），改用回环权威重试：${req.url}`);
+        // 只记 pathname：`req.url` 的 query 里是一次性启动令牌，
+        // 写进日志等于把它泄露到日志文件（dsh 自己刻意用 no-referrer 保护它）。
+        log('warn', `令牌交换被上游以 ${status} 拒绝（authority 未受信），改用回环权威重试`);
         proxyRes.resume();   // 丢弃这次响应体，随后重发
         forwardTokenExchange(req, res, TARGET, true);
         return;
@@ -846,7 +1073,7 @@ export function createRelay(options = {}) {
   // ── 普通 HTTP 代理 ──
   function handleRequest(req, res, auth, c) {
     requestCount += 1;
-    if (!authGate(req, res, null, auth, c.password, log)) return;
+    if (!authGate(req, res, null, auth, c.password, log, loginLimiter)) return;
 
     const TARGET = target();
 
@@ -947,6 +1174,54 @@ export function createRelay(options = {}) {
   let wsCompressionReady = null;
 
   /**
+   * 浏览器握手头里**绝不能**复制到上游的那一组 `sec-websocket-*`。
+   *
+   * 这一组描述的是「浏览器 ↔ 浏览器侧那个 ws 实例」之间已经完成的一次协商。
+   * 上游握手是另一次全新的、由 `ws` 客户端库自己发起的连接：
+   *
+   *   · `sec-websocket-key` / `sec-websocket-version` —— 必须由 ws 客户端库
+   *     按 RFC6455 **各自随机生成**。把浏览器的 key 抄过去会让上游对着一个
+   *     它没发过的 challenge 做校验，握手直接失败。
+   *   · `sec-websocket-extensions` —— 描述浏览器侧已协商的 perMessageDeflate。
+   *     上游客户端**不声明**压缩（见下方注释），却收到「对面支持 deflate」
+   *     的信号；若上游照着回 `permessage-deflate`，ws 客户端会抛
+   *     “Server sent permessage-deflate but client does not support it”。
+   *   · `sec-websocket-protocol` —— 浏览器侧的子协议选择与上游无关。
+   *
+   * 所以整组前缀都剔掉，而不是只剔 extensions/protocol：只剔一部分仍然是
+   * 把「一次协商的结果」当成「一次请求的输入」搬过去。
+   */
+  const WS_STRIP_PREFIX = 'sec-websocket-';
+
+  /** 剔除全部 `sec-websocket-*`，其余（cookie / authorization / 自定义头）保留。 */
+  function stripWebSocketHandshakeHeaders(headers) {
+    const h = { ...headers };
+    for (const k of Object.keys(h)) {
+      if (k.toLowerCase().startsWith(WS_STRIP_PREFIX)) delete h[k];
+    }
+    return h;
+  }
+
+  /**
+   * 构造上游 WebSocket 的 ws:// URL。
+   *
+   * 不再用字符串拼接 `` `ws://${host}:${port}${req.url}` ``：
+   *   · IPv6：TARGET.hostname 是去掉了方括号的裸地址，拼出来是
+   *     `ws://fe80::1:3091/...`，根本不是一个合法 URL；
+   *   · req.url 是原始 request-target，任何在路径里合法、在 URL 里不合法的
+   *     字符都会让解析结果偏离预期。
+   * 用 `new URL(req.url, base)` 让解析器处理 IPv6 与百分号编码。
+   */
+  function buildUpstreamWsUrl(TARGET, reqUrl) {
+    const base = `ws://${authorityOf(TARGET.hostname, TARGET.port)}/`;
+    try {
+      return new URL(reqUrl ?? '/', base);
+    } catch {
+      return new URL('/', base);
+    }
+  }
+
+  /**
    * 一条被帧代理接管的连接。
    *
    * 两端独立协商：浏览器侧开 `perMessageDeflate`，上游 dsh 侧**不开**
@@ -956,15 +1231,38 @@ export function createRelay(options = {}) {
     const { WebSocketServer, WebSocket } = wsMod;
 
     // 浏览器侧：接受升级并开启压缩（只服务这一条连接，收完即弃）
-    const wss = new WebSocketServer({ noServer: true, perMessageDeflate: WS_DEFLATE_OPTIONS });
+    // maxPayload 显式给值（ws 默认 100 MB）：dsh 的历史快照实测约 6.6 MB，
+    // 给到 64 MB 足够覆盖超大会话，同时挡住「一个帧吃满内存」的滥用。
+    // 注意这是**解压后**的限制 —— 压缩炸弹（小帧解出巨大内容）就是靠它兜住。
+    const wss = new WebSocketServer({
+      noServer: true,
+      perMessageDeflate: WS_DEFLATE_OPTIONS,
+      maxPayload: 64 * 1024 * 1024,
+    });
     wss.handleUpgrade(req, socket, head, (client) => {
       wss.close();   // 只服务这一条连接，收完即弃
 
       // 上游 dsh：**不声明压缩**，载荷与改造前一致。
       // 注意：ws 的构造是异步的，'open' 之前 send 会抛错 —— 用一个队列接住。
-      const upstream = new WebSocket(`ws://${TARGET.hostname}:${TARGET.port}${req.url}`, { headers: rawHeaders });
+      //
+      // rawHeaders 来自 prepareForwardHeaders（Host/Origin 改写 + 会话代签），
+      // 这里必须再过一遍 stripWebSocketHandshakeHeaders：Handshake 相关的
+      // `sec-websocket-*` 全部由 ws 客户端自己生成，抄浏览器的会握手失败。
+      const upstream = new WebSocket(buildUpstreamWsUrl(TARGET, req.url), {
+        headers: stripWebSocketHandshakeHeaders(rawHeaders),
+      });
       let upstreamOpen = false;
+      /**
+       * 上游连上之前收到的帧。
+       *
+       * 有界：上游握手期间客户端最多能塞进来的量是有限的一小段（正常情况
+       * 就一两帧 RPC 请求）。若不设上限，一个恶意客户端可以在握手窗口里
+       * 持续灌大帧，把这段时间内的内存吃光 —— 虽然窗口很短，但没必要留口子。
+       */
       const pendingToUpstream = [];
+      let pendingBytes = 0;
+      const PENDING_BYTES_LIMIT = 8 * 1024 * 1024;
+      const PENDING_ITEMS_LIMIT = 256;
 
       /** 任一端的关闭理由，透传给另一端。 */
       let closing = false;
@@ -973,6 +1271,7 @@ export function createRelay(options = {}) {
         if (closing) return;
         closing = true;
         pendingToUpstream.length = 0;
+        pendingBytes = 0;
         try { client.close(); } catch { /* 已关 */ }
         try { upstream.close(); } catch { /* 已关 */ }
         try { client.terminate(); } catch { /* 已关 */ }
@@ -987,16 +1286,39 @@ export function createRelay(options = {}) {
       client.on('message', (data, isBinary) => {
         wsBytesCounter.uplink += data.length;
         if (!upstreamOpen) {
-          // 上游还没连上：先排队，连上后按序补发
+          // 上游还没连上：先排队，连上后按序补发（有界，见上面的说明）
           pendingToUpstream.push({ data, isBinary });
+          pendingBytes += data.length;
+          if (pendingBytes > PENDING_BYTES_LIMIT || pendingToUpstream.length > PENDING_ITEMS_LIMIT) {
+            log('warn', 'WS 上游握手期间积压过多帧，主动断开该连接');
+            teardown('pending-overflow');
+          }
           return;
         }
         try { upstream.send(data, { binary: isBinary }); } catch { teardown('uplink-send-failed'); }
       });
 
       // dsh → 浏览器：这才是被压缩的大头（历史快照 4.6 MB 单帧）
+      //
+      // 背压闸门：`client.send()` 在 socket 写缓冲满时**不会**报错，而是把数据
+      // 留在 ws 的发送队列里继续涨。没有这道闸门，一个读取慢的客户端 + 一条
+      // 持续推送历史的上游，内存增长就是无界的。
+      //
+      // 阈值取 8 MiB 的理由（dsh 历史快照单帧实测 4~6.6 MB）：
+      // `bufferedAmount` 统计的是「已进入发送队列、尚未写完 socket」的字节，
+      // **不是**这一帧的大小。正常客户端的 TCP 窗口远大于 8 MiB，单帧通常在
+      // 下一帧到达之前就已写空，所以 `bufferedAmount` 在稳态下是个很小的数。
+      // 它涨到 8 MiB 意味着「客户端真的卡死 / 链路停滞」，而不是「这一帧大」。
+      // 因此正常 4~6 MB 的历史帧不会被误伤；只有连续多帧堵在队列里才触发，
+      // 且此时无论等多久都发不出去 —— 断开 + 一行 warn 比继续堆积更好排查。
+      // 兜底：`maxPayload` 64 MB 已经挡住单帧上限，这里管的是**累计**。
       upstream.on('message', (data, isBinary) => {
         wsBytesCounter.downlinkPlain += data.length;
+        if (client.bufferedAmount > WS_DOWNLINK_BACKPRESSURE_LIMIT) {
+          log('warn', `WS 下行背压超限：bufferedAmount=${client.bufferedAmount} B > ${WS_DOWNLINK_BACKPRESSURE_LIMIT} B，会话过大或客户端读取过慢，已断开该连接`);
+          teardown('downlink-backpressure');
+          return;
+        }
         try { client.send(data, { binary: isBinary }); } catch { teardown('downlink-send-failed'); }
       });
 
@@ -1008,6 +1330,7 @@ export function createRelay(options = {}) {
           try { upstream.send(item.data, { binary: item.isBinary }); } catch { teardown('uplink-flush-failed'); return; }
         }
         pendingToUpstream.length = 0;
+        pendingBytes = 0;
       });
 
       // 存活语义：把两端的 ping/pong 互相透传，保持 dsh 的心跳判定不变
@@ -1029,6 +1352,17 @@ export function createRelay(options = {}) {
    * 裸 socket 转发（`ws` 不可用时 / 用户关掉压缩时的回退路径）。
    *
    * 与改造前完全一致：不解析帧，只做双向 pipe。
+   *
+   * 两个方向的「已经读到但还没被 pipe 接管的字节」都必须处理，否则丢帧：
+   *
+   *   · `head`  —— 客户端在握手请求之后、同一 TCP 段里紧接着发来的字节。
+   *     Node 把它交给 'upgrade' 回调而不是留在 socket 流里。对 WS 客户端来说
+   *     这常常**就是第一帧 RPC 请求**（浏览器/客户端不等 101 就发）。丢掉它
+   *     的表现是「握手成功但没有任何回显」，而且极难排查。
+   *   · `head2` —— 上游在 101 之后紧接着发来的字节。
+   *
+   * 两者都需要在建立 pipe **之前**补写回去，否则顺序会错（迟到的帧排在
+   * pipe 进来的数据后面）。
    */
   function proxyUpgradeRaw({ req, socket, head, TARGET, c }) {
     const headers = prepareForwardHeaders(req, true, TARGET, c);
@@ -1048,8 +1382,14 @@ export function createRelay(options = {}) {
       h.connection = 'Upgrade';
       if (!h.upgrade) h.upgrade = 'websocket';
       socket.write(`HTTP/1.1 101 Switching Protocols\r\n${serializeHeaders(h)}\r\n`);
+      // 上游 → 客户端：上游在 101 之后紧接着发来的字节。unshift 塞回它的
+      // 可读侧，pipe 启动后就会被读到。
       if (head2 && head2.length) upstreamSocket.unshift(head2);
       upstreamSocket.pipe(socket);
+      // 客户端 → 上游：同样是 unshift（塞进可读侧），因为 pipe 从可读侧读。
+      // **不能**写成 upstreamSocket.write(head) —— 那是写进「要发给上游」的
+      // 方向，等于把客户端的首帧当成对端的响应发回去。
+      if (head && head.length) upstreamSocket.unshift(head);
       socket.pipe(upstreamSocket);
       const kill = () => {
         upstreamSocket.destroy();
@@ -1083,7 +1423,7 @@ export function createRelay(options = {}) {
 
   function handleUpgrade(req, socket, head, auth, c) {
     socket.on('error', () => socket.destroy());
-    if (!authGate(req, null, socket, auth, c.password, log)) return;
+    if (!authGate(req, null, socket, auth, c.password, log, loginLimiter)) return;
 
     const TARGET = target();
 
@@ -1111,13 +1451,45 @@ export function createRelay(options = {}) {
   // ── 启停 ──
 
   /**
+   * 启停串行化。
+   *
+   * `start()` 与 `stop()` 都可能被「HTTP 路由」与「启动定时器」并行触发。
+   * 没有串行化时会出现：start 正在 listen，此时 stop 拿到 running=false
+   * 直接返回，于是 start 起来后没人记得停 —— 端口泄漏、状态与事实不符。
+   * 这里把两者都挂到同一条 promise 链上，保证任何时刻只有一个在跑。
+   */
+  let lifecycleChain = Promise.resolve();
+  function serialized(fn) {
+    const run = lifecycleChain.then(fn, fn);
+    // 链上保留「已结算」的版本，避免一次异常让后续调用全部拒绝
+    lifecycleChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
    * 启动中转监听。
    * 端口被占用时**不退出进程**，置 lastError='port-in-use' 并返回失败。
    */
-  async function start() {
+  function start() {
+    return serialized(doStart);
+  }
+
+  async function doStart() {
     if (running) return status();
-    if (stopping) await stop();
     const c = cfg();
+
+    // ── 上游闸门：非回环目标必须显式知情 ──
+    //
+    // 放在最前面（连端口都不绑），这样「配错 targetHost」的代价是启动失败并
+    // 给出可读原因，而不是先占住中转端口再把流量转发到一个不该去的地方。
+    // 判据只看**显式配置**的 targetHost：留空（自动）永远走本进程 dsh 的回环端点。
+    if (c.targetHost && !c.allowOffHostTarget && !isLoopbackTargetHost(c.targetHost)) {
+      lastError = 'off-host-target';
+      log('error',
+        `拒绝启动：targetHost=${c.targetHost} 不在回环名单内（${LOOPBACK_TARGET_HOSTS.join(', ')}）。`
+        + '若确实要代理另一台 dsh，请在配置里显式设置 allowOffHostTarget=true。');
+      return status();
+    }
 
     const srv = http.createServer((req, res) => {
       try {
@@ -1204,12 +1576,15 @@ export function createRelay(options = {}) {
    * 幂等：重复调用安全；等待在途连接关闭，最多 STOP_DRAIN_TIMEOUT_MS。
    */
   function stop() {
+    return serialized(doStop);
+  }
+
+  function doStop() {
     if (!running || !server) {
       running = false;
       server = null;
       return Promise.resolve(status());
     }
-    stopping = true;
     const srv = server;
     return new Promise((resolve) => {
       let settled = false;
@@ -1239,7 +1614,6 @@ export function createRelay(options = {}) {
         }
         server = null;
         running = false;
-        stopping = false;
         boundListen = null;
         log('info', '中转已停止，端口已释放');
         resolve(status());
@@ -1269,19 +1643,29 @@ export function createRelay(options = {}) {
     const listenPort = running && boundListen ? boundListen.port : c.listenPort;
     let targetInfo = null;
     let dsh = null;
+    let endpointError = null;
     try {
       const dshEp = getDshEndpoint();
       dsh = { host: dshEp.host, port: dshEp.port, address: authorityOf(dshEp.host, dshEp.port) };
       const t = target();
       targetInfo = { host: t.hostname, port: t.port, origin: t.origin };
     } catch (err) {
-      lastError = lastError ?? `endpoint: ${err?.message || err}`;
+      // 局部变量，**不写回 lastError**。
+      //
+      // status() 是纯读函数：UI 每 3 秒轮询一次、relay_status 工具随时可调，
+      // 让它改持久状态意味着「看一眼」会改变 relay 的行为 —— 一次偶发的
+      // endpoint 读取失败会把 lastError 钉死，之后即使中转正常启动，
+      // 状态也会因为这个陈旧值而显示成 error。
+      endpointError = `endpoint: ${err?.message || err}`;
     }
-    const st = running ? 'running' : lastError ? 'error' : 'stopped';
+    const effectiveError = lastError ?? endpointError;
+    const st = running ? 'running' : effectiveError ? 'error' : 'stopped';
     return {
       state: st,
       listen: { host: listenHost, port: listenPort, address: authorityOf(listenHost, listenPort) },
       target: targetInfo,
+      // 上游是否落在回环之外：排查「为什么拒绝启动 / 流量去了哪」时一眼可辨
+      targetIsOffHost: Boolean(c.targetHost) && !isLoopbackTargetHost(c.targetHost),
       dsh,
       forceLoopback: c.forceLoopback,
       hasPassword: Boolean(c.password),
@@ -1300,7 +1684,7 @@ export function createRelay(options = {}) {
       },
       startedAt: running ? startedAt : null,
       uptimeMs: running ? Date.now() - startedAt : 0,
-      lastError,
+      lastError: effectiveError,
     };
   }
 

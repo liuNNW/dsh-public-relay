@@ -88,7 +88,12 @@ window.__ModuleLoader__.load({
       listenPort: '中转监听端口',
       listenPortHint: '隧道「本地端口」填这个值。填 0 让系统自动分配。',
       password: '访问口令',
-      passwordHint: '留空将关闭口令认证，任何能连到中转端口的人都能直接进入。',
+      passwordHint: '留空表示「保持当前口令不变」。口令从不回填、也不会显示，只能整体覆盖或清除。',
+      passwordPlaceholder: '（不修改请留空）',
+      passwordClear: '清除口令',
+      passwordSetHint: '已设置口令。留空保存 = 保持不变；填新值 = 换成新口令。',
+      passwordNoneHint: '⚠ 当前没有口令 —— 任何能连到中转端口的人都能直接进入。',
+      passwordWillClear: '保存后将清除口令 —— 届时任何人都能直接进入。',
       forceLoopback: '强制回环改写',
       forceLoopbackHint: '把客户端 bundle 里的 isLoopback 判定改成恒真，使公网域名访问时 dsh 仍认为自己是本机（插件列表不降级）。dsh 已支持 trustedHosts 时可关掉。',
       autoSession: '自动管理 dsh 会话',
@@ -149,7 +154,12 @@ window.__ModuleLoader__.load({
       listenPort: 'Listen port',
       listenPortHint: 'The tunnel’s local port. Use 0 to let the OS choose.',
       password: 'Passcode',
-      passwordHint: 'Leave empty to disable passcode auth — anyone who can reach the port gets in.',
+      passwordHint: 'Leave empty to keep the current passcode. The passcode is never read back or displayed — you can only replace or clear it.',
+      passwordPlaceholder: '(leave empty to keep)',
+      passwordClear: 'Clear passcode',
+      passwordSetHint: 'A passcode is set. Save with the field empty to keep it, or type a new value to replace it.',
+      passwordNoneHint: '⚠ No passcode is set — anyone who can reach the relay port gets straight in.',
+      passwordWillClear: 'Saving will clear the passcode — anyone who can reach the port will get in.',
       forceLoopback: 'Force loopback patch',
       forceLoopbackHint: 'Rewrites the client bundle’s isLoopback check to true so dsh still treats a public hostname as local. Turn this off once you configure dsh trustedHosts.',
       autoSession: 'Manage dsh session automatically',
@@ -373,11 +383,21 @@ window.__ModuleLoader__.load({
           : !config || config.autoSession !== false
       );
 
+      /**
+       * 表单草稿。
+       *
+       * 口令是 **write-only** 的：宿主半的 status 不再返回它（否则一次
+       * 免认证/低权限读请求就能拿到唯一边界）。所以这里永远是空字符串，
+       * 输入框也只是「填了就改成新口令」，不回填旧值。
+       * `passwordTouched` 用来区分「没动」与「有意清空」。
+       */
       const draftFrom = (config) => ({
         enabled: config.enabled !== false,
         listenHost: String(config.listenHost ?? ''),
         listenPort: String(config.listenPort ?? ''),
-        password: String(config.password ?? ''),
+        password: '',
+        passwordTouched: false,
+        hasPassword: config.hasPassword === true,
         forceLoopback: config.forceLoopback !== false,
         autoSession: wantedAutoSession(config),
         compressWebSocket: config.compressWebSocket !== false,
@@ -410,11 +430,13 @@ window.__ModuleLoader__.load({
 
       const cfg = snap && snap.config ? snap.config : null;
       const cfgAutoSession = cfg ? wantedAutoSession(cfg) : true;
+      // 口令不回填，所以只在用户真的敲过之后才算「改动」
+      const passwordChanged = Boolean(draft && draft.passwordTouched === true);
       const dirty = Boolean(cfg && draft) && (
         draft.enabled !== (cfg.enabled !== false)
         || draft.listenHost !== String(cfg.listenHost ?? '')
         || draft.listenPort !== String(cfg.listenPort ?? '')
-        || draft.password !== String(cfg.password ?? '')
+        || passwordChanged
         || draft.forceLoopback !== (cfg.forceLoopback !== false)
         || draft.autoSession !== cfgAutoSession
         || draft.compressWebSocket !== (cfg.compressWebSocket !== false)
@@ -449,7 +471,9 @@ window.__ModuleLoader__.load({
             enabled: draft.enabled,
             listenHost: draft.listenHost.trim(),
             listenPort: portText === '' ? 0 : parseInt(portText, 10),
-            password: draft.password,
+            // 只有用户真的动过口令框才带上这个字段 —— 不带 = 保持原口令。
+            // 宿主半按「字段是否存在」判断，见 writeConfig 的说明。
+            ...(passwordChanged ? { password: draft.password } : {}),
             forceLoopback: draft.forceLoopback,
             autoSession: draft.autoSession,
             compressWebSocket: draft.compressWebSocket,
@@ -586,17 +610,27 @@ window.__ModuleLoader__.load({
       } else {
         const disabled = busy !== '';
 
-        const textField = (field, label, hint, placeholder) =>
+        /**
+         * 单行文本字段。
+         * @param opts.secret - 口令类输入：用 password 类型（不明文显示），
+         *   并且改动时打 passwordTouched 标记（见 draftFrom 的说明）。
+         */
+        const textField = (field, label, hint, placeholder, opts = {}) =>
           h('div', { key: field, className: 'dsr-field' },
             h('label', { className: 'dsr-label', htmlFor: `dsr-${mode}-${field}` }, label),
             h('input', {
               id: `dsr-${mode}-${field}`,
               className: 'dsr-input',
-              type: 'text',
+              type: opts.secret === true ? 'password' : 'text',
+              autoComplete: opts.secret === true ? 'new-password' : 'off',
               value: draft[field],
               placeholder,
               disabled,
-              onChange: (event) => setDraft((d) => ({ ...d, [field]: event.target.value })),
+              onChange: (event) => setDraft((d) => ({
+                ...d,
+                [field]: event.target.value,
+                ...(opts.secret === true ? { passwordTouched: true } : {}),
+              })),
             }),
             h('p', { className: 'dsr-text' }, hint));
 
@@ -628,12 +662,32 @@ window.__ModuleLoader__.load({
           }),
           h('p', { className: portBad ? 'dsr-note dsr-err' : 'dsr-text' },
             portBad ? t('portInvalid') : t('listenPortHint'))));
-        body.push(textField('password', t('password'), t('passwordHint'), ''));
+        // 口令：write-only。留空 = 保持不变，填值 = 覆盖，另有「清除」按钮。
+        const effectiveHasPassword = passwordChanged ? draft.password !== '' : draft.hasPassword === true;
+        body.push(textField(
+          'password',
+          t('password'),
+          effectiveHasPassword ? t('passwordSetHint') : t('passwordNoneHint'),
+          t('passwordPlaceholder'),
+          { secret: true },
+        ));
+        if (effectiveHasPassword) {
+          body.push(h('div', { key: 'pwClear', className: 'dsr-actions' },
+            h('button', {
+              type: 'button',
+              className: 'dsr-btn dsr-btnSm',
+              disabled,
+              onClick: () => setDraft((d) => ({ ...d, password: '', passwordTouched: true })),
+            }, t('passwordClear'))));
+        }
+        if (passwordChanged && draft.password === '' && draft.hasPassword === true) {
+          body.push(h('p', { key: 'pwWillClear', className: 'dsr-note dsr-err' }, t('passwordWillClear')));
+        }
         body.push(checkField('forceLoopback', t('forceLoopback'), t('forceLoopbackHint')));
         body.push(checkField('autoSession', t('autoSession'), t('autoSessionHint')));
         // WS 压缩：会话历史是明文大帧，这是「切会话卡」的直接解药
         body.push(checkField('compressWebSocket', t('compressWebSocket'), t('compressWebSocketHint')));
-        if (draft.password === '') {
+        if (!effectiveHasPassword) {
           body.push(h('p', { key: 'autoSessionBlocked', className: 'dsr-note dsr-err' }, t('autoSessionBlockedWarn')));
         }
 

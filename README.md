@@ -99,23 +99,59 @@ node dsh-public-relay.js --target http://127.0.0.1:3085 # 换个上游
    │  (隧道：樱花映射 / frp)
    ▼
 中转（插件版：跑在 dsh 进程内 / 脚本版：独立进程）
-   ├─ authGate()            口令认证（Cookie 会话 / 登录页 / 401）
+   ├─ authGate()            口令认证（Cookie 会话 / 登录页 / 限流 / 401）
    ├─ 会话代签              按 dsh 格式注入 dsh-auth-* Cookie
    ├─ force-loopback        改写客户端 bundle 的 isLoopback
    ├─ handleRequest()       HTTP 反向代理（Host/Origin 改写）
-   └─ handleUpgrade()       WebSocket upgrade 代理
+   └─ handleUpgrade()       WebSocket upgrade 代理（帧级 + 压缩）
    │
    ▼
 dsh 自身监听端口（插件版：热读 ctx.webServer；脚本版：由守护进程托管）
 ```
 
+两种形态**共用 `lib/` 的同一份实现**。独立脚本曾有一份手抄副本，审计发现其中 6 个安全
+问题（CRLF 注入、免认证 body 累积、无登录限流、Cookie 缺 `Secure`、`force-loopback` 认不出
+combo URL、WebSocket 丢首帧）全部源于两份实现的漂移 —— 逐条修库版不能根治，只要副本还在，
+下次修库它就漂移回去。现已删除全部手抄代码，脚本 `import` 库。
+
 ### 认证设计
+
+中转口令是暴露到公网的**唯一**边界，所有认证原语集中在 `lib/auth.js`，宿主半与中转共用。
 
 - Cookie 名 `relay_session`，值 `payload.signature`（base64url）
 - 签名 `HMAC-SHA256(HMAC-SHA256("dsh-public-relay", password), payload)`
-- 校验用 `crypto.timingSafeEqual`，防时序侧信道
-- 登录失败固定延时 400ms，拖慢暴力破解
-- Cookie 属性 `HttpOnly; SameSite=Lax; Path=/`，7 天 TTL
+- 校验用 `crypto.timingSafeEqual`；登录口令先两侧哈希再比，避免长度差异
+- Cookie 属性 `HttpOnly; SameSite=Lax; Path=/`，7 天 TTL；隧道走 HTTPS 时自动加 `Secure`
+- 登录失败固定延时 400ms，外加**滑动窗口限流**（同 IP 5 分钟内 8 次失败即 429）
+
+限流键默认取 `socket.remoteAddress`。**只有当直连对端本身是回环地址**（即确实有隧道
+或反代夹在中间）才读 `x-forwarded-for`，并取**最后一项** —— 隧道追加的是链尾才是真实
+来源。反代不校验 XFF 的话，攻击者每次换一个伪造 XFF 就能重置计数器，限流形同虚设。
+代价是隧道场景下所有客户端共享「隧道出口 IP」这一个键，限流偏严而非偏松。
+
+### 管理路由的鉴权
+
+`/dsh-public-relay/config` 与 `/dsh-public-relay/control` 改的是监听地址、上游目标
+和口令，**必须比普通请求更严**。它们要求：
+
+1. 中转口令派生的 bearer token（`Authorization: Bearer …`）或有效的 `relay_session` Cookie
+2. 同源（`Origin` 的 host 等于 `Host`），或对端是回环地址
+
+这两条缺一不可：仅靠 Origin 是不够的 —— 中转会把每个转发请求的 `Host`/`Origin` 改写成
+上游回环权威，所以经公网进来的请求在 dsh 侧「Origin == Host」按构造必然成立。反过来，
+仅靠 bearer 也不够：无口令时中转允许无认证转发，那时就只剩「对端必须是回环」这一条。
+
+> **无口令 ≠ 管理路由开放**。口令为空且监听 `0.0.0.0` 时，管理路由对非回环来源一律 403；
+> 本机 UI 与 `relay_status` / `relay_control` 工具不受影响。
+
+### 会话代签的权限边界
+
+`autoSession` 用 `$DSH_HOME/.credentials.yaml` 里的持久密钥代签 dsh 会话 Cookie。
+它签出的是**完整的 dsh 管理员会话**（工具执行、文件访问、设置改写），不是只读视图。
+
+- 口令为空时**强制关闭**（`config.js` 的硬约束）
+- 凭据读取失败或连续 10 分钟读不到 → 停止注入，退回「用 `?token=` 登录」，不会把人锁在门外
+- ⚠ 改中转口令**不会**让已签发的 dsh 会话失效 —— 它们由 dsh 的持久密钥签名，不是由口令签名
 
 ### `force-loopback` 怎么改写
 
@@ -139,19 +175,20 @@ dsh 升级换写法也不会静默失效。
 ## 仓库结构
 
 ```
-dsh-public-relay.js              独立脚本版（守护进程 + 反向代理）
+dsh-public-relay.js              独立脚本版（守护进程 + 反向代理，复用 lib/）
 plugin/
   dsh-public-relay/              插件版（npm 包本体）
-    lib/index.js                 宿主半：配置、路由、启停编排、全局工具
+    lib/index.js                 宿主半：配置、路由、鉴权、启停编排、全局工具
     lib/relay.js                 中转核心：代理 + 认证 + isLoopback 改写
+    lib/auth.js                  认证原语：口令会话、限流器、回环判定（宿主半与中转共用）
     lib/dsh-cookie.js            按 dsh 格式代签会话 Cookie
     lib/config.js                配置契约
     lib/client.js                浏览器半：两个设置座位 + 自绘表单
     cordis.patch.yml             bundle 补丁层
     locale/{zh,en}.json          插件列表展示元数据
-  install.ps1                    自检 / 安装指引 / 旧安装残留清理
-  tools/                         诊断与开发工具
-  tests/                         五套测试（248 项断言）
+  install.ps1                    自检 / 安装指引 / 旧安装残留清理（须保持 UTF-8 BOM）
+  tools/                         诊断、安全审计与开发工具
+  tests/                         五套测试（332 项断言）
 ```
 
 ---
@@ -160,11 +197,11 @@ plugin/
 
 ```powershell
 # 五套测试
-node plugin\tests\smoke.mjs              # 中转核心      76 项
-node plugin\tests\host-integration.mjs   # 宿主半        53 项
-node plugin\tests\client-half.mjs        # 浏览器半      62 项
-node plugin\tests\dsh-session.spec.mjs   # 会话代签      52 项
-node plugin\tests\password-modes.mjs     # 口令模式       5 项
+node plugin\tests\smoke.mjs              # 中转核心      109 项
+node plugin\tests\host-integration.mjs   # 宿主半         79 项
+node plugin\tests\client-half.mjs        # 浏览器半       62 项
+node plugin\tests\dsh-session.spec.mjs   # 会话代签       76 项
+node plugin\tests\password-modes.mjs     # 口令模式        6 项
 
 # 一键自检（manifest 兼容性 + 语法 + 四套测试）
 powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Check
@@ -177,6 +214,22 @@ node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" grep "<正则>" [�
 node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" ls  [路径前缀]
 node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" cat <内部路径>
 ```
+
+### 安全审计工具
+
+`tools/audit-*.mjs` 是 2026-10 那轮安全审查留下的可复跑探针，每个脚本针对一个具体的
+历史漏洞。它们不是回归测试（那些在 `tests/` 里），而是**当你不确定某个防线是否还在时**
+可以手动敲一条命令去戳的那个洞：
+
+```powershell
+node plugin\tools\audit-token-bypass.mjs     # ?token= 后门是否又被打开
+node plugin\tools\audit-csrf.mjs            # 管理路由的 Origin 判定是否可绕
+node plugin\tools\audit-status-leak.mjs     # status / 工具是否泄露口令或密钥路径
+node plugin\tools\audit-hardening.mjs       # 限流 / body 上限 / CRLF 过滤 / 恒定时比较
+node plugin\tools\audit-patcher-edges.mjs   # isLoopback 改写是否会产生语法错误的 JS
+```
+
+修改认证、限流或改写逻辑后，值得跑一遍。
 
 ### 插件安装 / 清理
 
@@ -230,6 +283,14 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 **`install.ps1` 报语法错误（`The token '||' is not a valid statement separator` 等）**
 Windows PowerShell 5.1 按系统 ANSI 代码页读无 BOM 脚本，而本脚本是 UTF-8。
 保持该文件为 **UTF-8 带 BOM** 即可；用 PowerShell 7 跑不受影响。
+
+> ⚠ **编辑 `install.ps1` 时必须补回 BOM**。多数编辑器与本环境的文件编辑工具写入时会
+> 剥掉它，一旦剥掉脚本在 PowerShell 5.1 下会静默变成无法执行。这是该文件的存活条件。
+
+**403（管理路由被拒）**
+`/config`、`/control` 需要 bearer token 或 `relay_session` Cookie。从公网经隧道访问时，
+宿主半的 Origin 检查会因中转改写过 Host 而失效 —— 请带上口令派生的 token 调用。
+本机 UI 与工具调用不受影响。
 
 **设置里完全没有这个插件**
 1. `plugin_manager list_plugins` 里 `include:dsh-public-relay` 的 `fiberPhase` 是否为 `active`

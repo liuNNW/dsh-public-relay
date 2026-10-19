@@ -10,16 +10,37 @@
  *   2. 启动 HTTP 反向代理（Host/Origin 改写放行信任栅栏 + WebSocket upgrade）
  *   3. 默认 --force-loopback（公网可看插件列表）；口令留空时启动即随机生成并打印
  *
- * 零第三方依赖，仅用 Node 内置模块。
+ * ── 为什么代理逻辑直接 import 插件的 lib/ ──────────────────────────────────
+ *
+ * 本文件此前自带一份「手抄版」代理实现。审计证明它与 lib/ 已经漂移很远，
+ * 并且带着一整套 lib/ 里早已修掉的漏洞：
+ *
+ *   · `serializeHeaders` 不过滤 CR/LF → 上游响应头里的 \r\n 可以注入新响应头
+ *     （HTTP response splitting）。lib/relay.js 的同名函数专门做了过滤与头名校验。
+ *   · `POST /__login` 在**未认证**状态下无上限地累积 body，且超限后既不 413
+ *     也不 destroy —— 免认证的内存耗尽入口。lib/ 版超限即 413 + destroy。
+ *   · 完全没有登录限流。lib/ 版有按来源 IP 的滑动窗口。
+ *   · Cookie 不带 Secure（HTTPS 隧道下会随明文端口一起发）。
+ *   · force-loopback 只认单个固定 pathname + 单一正则，而 0.2.x 客户端走 combo
+ *     URL（`/plugins/??…&rev=`），于是**永远命中不了** —— 公网看不到插件列表，
+ *     而日志里只有一行 warn，看起来像「正常但没生效」。
+ *   · WebSocket upgrade 丢弃客户端握手后的 `head`，首帧直接丢失。
+ *
+ * 继续「手抄同步」等于每修一处库就要再抄一次、再漂移一次 —— 审计里那些
+ * 漏洞正是这样产生的。所以这里改成**单一事实来源**：本文件只负责参数解析、
+ * 口令生成、dsh web 守护与日志，代理核心直接用 lib/relay.js 的 createRelay()。
+ * lib/ 修一次，插件入口与脚本入口同时受益。
+ *
+ * 代价：脚本不再是「单文件自包含」，需要与 plugin/ 目录一起分发。
+ * 这是有意的取舍 —— 一个自我复制、且复制品比原件弱的副本，比依赖更危险。
  */
 'use strict';
 
-const http = require('node:http');
 const crypto = require('node:crypto');
-const { URL } = require('node:url');
-const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
+const { pathToFileURL } = require('node:url');
 
 // ─────────────────────────── 参数解析 ───────────────────────────
 
@@ -38,6 +59,8 @@ dsh-public-relay — DSH Web 中转脚本（樱花映射 TCP 内网穿透）
 功能:
   1. 启动 dsh web 子进程并守护（崩溃自动重启，日志写入 dsh-web.log）
   2. 启动 HTTP 反向代理中转（Host/Origin 改写 + WebSocket upgrade）
+
+  代理核心复用 plugin/dsh-public-relay/lib/relay.js（与插件版同一份代码）。
 
 选项:
   --host <ip>          中转监听地址（默认 127.0.0.1）
@@ -146,120 +169,6 @@ function resolveTarget(raw) {
   };
 }
 
-// ─────────────────────────── 头部改写 ───────────────────────────
-
-// hop-by-hop 头：逐跳语义，不能透传；upgrade 场景单独保留 connection/upgrade
-const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
-
-function rewriteHeaders(headers, forUpgrade, target) {
-  const h = { ...headers };
-  h.host = target.authority;                     // 栅栏要求 Host 是回环权威
-  if (h.origin) h.origin = target.origin;        // 栅栏要求 Origin == Host 权威
-  for (const k of HOP_BY_HOP) delete h[k];
-  if (forUpgrade) {
-    h.connection = 'Upgrade';
-    h.upgrade = h.upgrade || 'websocket';
-  }
-  return h;
-}
-
-function stripHopByHop(headers) {
-  const h = { ...headers };
-  for (const k of HOP_BY_HOP) delete h[k];
-  return h;
-}
-
-function serializeHeaders(headers) {
-  let out = '';
-  for (const [k, v] of Object.entries(headers)) {
-    if (v === undefined || v === null) continue;
-    for (const val of Array.isArray(v) ? v : [v]) out += `${k}: ${val}\r\n`;
-  }
-  return out;
-}
-
-// ─────────────────────────── 可选口令认证 ───────────────────────────
-
-function makeAuth(password) {
-  const secret = crypto.createHmac('sha256', 'dsh-public-relay').update(password).digest();
-  const cookieName = 'relay_session';
-  const COOKIE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
-
-  function signToken(exp) {
-    const payload = Buffer.from(JSON.stringify({ exp })).toString('base64url');
-    const sig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
-    return `${payload}.${sig}`;
-  }
-
-  function verifyToken(token) {
-    if (typeof token !== 'string') return false;
-    const dot = token.indexOf('.');
-    if (dot <= 0) return false;
-    const payload = token.slice(0, dot);
-    const sig = token.slice(dot + 1);
-    const expected = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
-    const a = Buffer.from(sig);
-    const b = Buffer.from(expected);
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
-    try {
-      const { exp } = JSON.parse(Buffer.from(payload, 'base64url').toString());
-      return typeof exp === 'number' && exp > Date.now();
-    } catch {
-      return false;
-    }
-  }
-
-  function parseCookies(req) {
-    const out = {};
-    const raw = req.headers.cookie;
-    if (!raw) return out;
-    for (const part of raw.split(';')) {
-      const eq = part.indexOf('=');
-      if (eq <= 0) continue;
-      try {
-        const k = decodeURIComponent(part.slice(0, eq).trim());
-        const v = decodeURIComponent(part.slice(eq + 1).trim());
-        out[k] = v;
-      } catch {
-        /* 忽略非法 cookie */
-      }
-    }
-    return out;
-  }
-
-  const LOGIN_PAGE = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dsh-public-relay 登录</title>
-<style>
-  body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#0f1115;color:#e6e6e6;
-       display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-  .card{background:#1a1d24;border:1px solid #2c313c;border-radius:12px;padding:32px;width:320px}
-  h1{font-size:18px;margin:0 0 4px} p{color:#9aa3b2;font-size:13px;margin:0 0 20px}
-  input{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #3a4150;
-        background:#12141a;color:#e6e6e6;font-size:14px}
-  button{margin-top:14px;width:100%;padding:10px;border:0;border-radius:8px;background:#3b82f6;
-         color:#fff;font-size:14px;cursor:pointer}
-  button:hover{background:#2f6fe0}
-  .err{color:#f87171;font-size:13px;margin-top:10px}
-</style>
-</head>
-<body>
-  <form class="card" method="post" action="/__login">
-    <h1>dsh-public-relay 访问口令</h1>
-    <p>请输入启动时设置的口令以继续</p>
-    <input type="password" name="password" placeholder="口令" autocomplete="off" autofocus required>
-    <button type="submit">进入</button>
-    ${'__ERR__'}
-  </form>
-</body>
-</html>`;
-
-  return { cookieName, signToken, verifyToken, parseCookies, LOGIN_PAGE, COOKIE_TTL_MS };
-}
-
 // ─────────────────────────── 主逻辑 ───────────────────────────
 
 const config = parseArgs(process.argv.slice(2));
@@ -283,18 +192,12 @@ if (config.password === '' && !passwordGivenExplicitly) {
 }
 
 const TARGET = resolveTarget(config.target);
-const AUTH = config.password ? makeAuth(config.password) : null;
-const UPSTREAM = { hostname: TARGET.hostname, port: TARGET.port };
 
-function log(method, path, status, remote, ms) {
-  console.log(`[${new Date().toISOString()}] ${method} ${path} ${status} ${remote || '?'} ${ms}ms`);
-}
-
-// ─────────────────────────── dsh web 守护进程（诊断增强版）───────────────────────────
+// ─────────────────────────── dsh web 守护进程 ───────────────────────────
 
 let dshProcess = null;      // 当前 dsh web 子进程
-let dshPid = null;           // 进程组 PID（detached 模式下用于杀整棵树）
-let watchdogLog = null;      // 日志文件流
+let dshPid = null;          // 进程 PID（Windows 下可能是 cmd.exe 的）
+let watchdogLog = null;     // 日志文件流
 let restartTimer = null;
 let restartCount = 0;
 const WATCHDOG_LOG_FILE = path.join(__dirname, 'dsh-web.log');
@@ -303,17 +206,20 @@ const RAPID_CRASH_THRESHOLD = 3;
 const RAPID_CRASH_WINDOW_MS = 30000;
 const rapidCrashes = [];    // 最近崩溃时间戳
 
-// 诊断：跟踪每次 dsh web 的输出情况
-let dshStartTime = null;
-let dshStdoutLines = 0;
-let dshStderrLines = 0;
-let dshLastStdout = '';
-let dshLastStderr = '';
+/**
+ * 关闭流程开始后置位。
+ *
+ * 之前 stopDshWeb() 只清了 restartTimer，但**正在退出**的子进程随后仍会触发
+ * 'exit' 回调，那个回调会在关闭过程中再排一个 startDshWeb 的重设定时器 ——
+ * 于是 shutdown 刚把 dsh web 停掉，守护又把它拉起来。
+ * 这个标志让 exit 回调知道「已经收摊了」，不再重启。
+ */
+let shuttingDown = false;
 
 function watchdogLogLine(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
   console.log(line);
-  try { if (watchdogLog) watchdogLog.write(line + '\n'); } catch {}
+  try { if (watchdogLog) watchdogLog.write(line + '\n'); } catch { /* 日志失败不应影响主流程 */ }
 }
 
 function isRapidCrash() {
@@ -353,15 +259,9 @@ function checkDshLogs() {
 }
 
 function startDshWeb() {
+  if (shuttingDown) return;
   if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
   restartCount++;
-
-  // 重置诊断计数器
-  dshStartTime = Date.now();
-  dshStdoutLines = 0;
-  dshStderrLines = 0;
-  dshLastStdout = '';
-  dshLastStderr = '';
 
   watchdogLogLine(`═══ dsh web 启动（第 ${restartCount} 次）═══`);
   watchdogLogLine(`  命令: dsh web`);
@@ -369,68 +269,53 @@ function startDshWeb() {
   watchdogLogLine(`  Node: ${process.version}`);
   watchdogLogLine(`  平台: ${process.platform} ${process.arch}`);
 
-  // detached: true → 子进程独立于父进程（Windows 下父进程退出不会连带杀掉）
-  // shell: true → Windows 需要通过 cmd.exe 找到 dsh.cmd
+  // shell: true → Windows 需要通过 cmd.exe 找到 dsh.cmd。
+  // 注意：此时 dshPid 是 **cmd.exe** 的 PID，不是 node 的 —— 见 stopDshWeb。
   dshProcess = spawn('dsh', ['web'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     shell: true,
-    detached: true,
     windowsHide: true,
   });
 
   dshPid = dshProcess.pid;
   watchdogLogLine(`  PID: ${dshPid}`);
 
+  // 按行切分，并保留可能不完整的最后一段（一条 chunk 可能在 \n 处断开）。
+  // 之前是对每个 chunk 独立 trimEnd + split，会把跨 chunk 的行截成两半，
+  // 日志因此出现莫名其妙的半行。
+  let outBuf = '';
   dshProcess.stdout.on('data', (d) => {
-    const lines = d.toString().trimEnd();
-    for (const line of lines.split('\n')) {
+    outBuf += d.toString();
+    const parts = outBuf.split('\n');
+    outBuf = parts.pop();
+    for (const line of parts) {
       const trimmed = line.trim();
-      if (!trimmed) continue;
-      dshStdoutLines++;
-      dshLastStdout = trimmed;
-      watchdogLogLine(`[dsh-web] ${trimmed}`);
+      if (trimmed) watchdogLogLine(`[dsh-web] ${trimmed}`);
     }
   });
 
+  let errBuf = '';
   dshProcess.stderr.on('data', (d) => {
-    const lines = d.toString().trimEnd();
-    for (const line of lines.split('\n')) {
+    errBuf += d.toString();
+    const parts = errBuf.split('\n');
+    errBuf = parts.pop();
+    for (const line of parts) {
       const trimmed = line.trim();
-      if (!trimmed) continue;
-      dshStderrLines++;
-      dshLastStderr = trimmed;
-      watchdogLogLine(`[dsh-web ERR] ${trimmed}`);
+      if (trimmed) watchdogLogLine(`[dsh-web ERR] ${trimmed}`);
     }
   });
 
   dshProcess.on('exit', (code, signal) => {
-    const uptimeSec = ((Date.now() - dshStartTime) / 1000).toFixed(1);
     dshProcess = null;
     dshPid = null;
 
     const reason = signal ? `signal=${signal}` : `exit code=${code}`;
     watchdogLogLine(`═══ dsh web 退出（${reason}）═══`);
-    watchdogLogLine(`  存活时长: ${uptimeSec} 秒`);
-    watchdogLogLine(`  stdout 行数: ${dshStdoutLines}`);
-    watchdogLogLine(`  stderr 行数: ${dshStderrLines}`);
-    if (dshLastStdout) watchdogLogLine(`  最后 stdout: ${dshLastStdout}`);
-    if (dshLastStderr) watchdogLogLine(`  最后 stderr: ${dshLastStderr}`);
 
-    // 静默崩溃检测：非正常退出 + 没有任何输出
-    if (code !== 0 && code !== 130 && dshStdoutLines <= 1 && dshStderrLines === 0) {
-      watchdogLogLine('');
-      watchdogLogLine('  ⚠⚠⚠ 静默崩溃：dsh web 退出前没有任何错误输出 ⚠⚠⚠');
-      watchdogLogLine('  可能原因:');
-      watchdogLogLine('    1. Windows 杀毒软件拦截（检查 Windows Defender 历史记录）');
-      watchdogLogLine('    2. Node.js 原生模块崩溃（不经过 JS 错误处理）');
-      watchdogLogLine('    3. 系统内存不足（检查任务管理器）');
-      watchdogLogLine('    4. dsh web 内部调用了 process.exit(1)');
-      watchdogLogLine('  排查步骤:');
-      watchdogLogLine('    a. 检查 Windows 事件查看器 → Windows 日志 → 应用程序');
-      watchdogLogLine('    b. 在 CMD 中手动运行: dsh web > dsh-stdout.log 2>&1');
-      watchdogLogLine('    c. 运行: node --version 确认 Node 正常');
-      checkDshLogs();
-      watchdogLogLine('');
+    // 关键：关闭流程一旦开始，绝不再把它拉起来。
+    if (shuttingDown) {
+      watchdogLogLine('  中转正在关闭，不再重启 dsh web');
+      return;
     }
 
     // exit code 0 或 130(Ctrl+C) = 正常退出，不重启
@@ -454,21 +339,47 @@ function startDshWeb() {
   });
 }
 
+/**
+ * 停掉 dsh web 及其子进程。
+ *
+ * 之前这里用 `process.kill(-pid)` 杀「进程组」，在 Windows 上根本不成立：
+ *   · 负 PID 的 kill 在 Windows 无效，抛错；
+ *   · 于是退回 dshProcess.kill()，而那只能杀掉 cmd.exe 壳，真正的
+ *     `dsh web`（node）子进程活了下来，继续占着 3080；
+ *   · 两秒后的 SIGKILL 又在 dshPid 已被置 null 之后才去读它，
+ *     process.kill(-null) 指向的是**本进程自己的进程组**。
+ *
+ * 现在：Windows 用 taskkill /T /F（/T = 连子树一起杀），其它平台才用进程组。
+ * 并把 pid 抓进闭包，避免与置空之间的竞态。
+ */
 function stopDshWeb() {
+  shuttingDown = true;
   if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
-  if (dshPid) {
-    watchdogLogLine('正在停止 dsh web（杀进程组）...');
+  const pid = dshPid;
+  if (!pid) return;
+
+  watchdogLogLine('正在停止 dsh web（连同子进程）...');
+
+  if (process.platform === 'win32') {
+    // /T 杀整棵子树，/F 强制。这才是 Windows 上唯一正确的做法。
     try {
-      process.kill(-dshPid, 'SIGTERM');
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
     } catch {
-      try { if (dshProcess) dshProcess.kill('SIGTERM'); } catch {}
+      try { if (dshProcess) dshProcess.kill('SIGKILL'); } catch { /* 已退出 */ }
     }
-    setTimeout(() => {
-      try { process.kill(-dshPid, 'SIGKILL'); } catch {}
-    }, 2000).unref();
-    dshPid = null;
-    dshProcess = null;
+  } else {
+    try {
+      process.kill(-pid, 'SIGTERM');
+    } catch {
+      try { if (dshProcess) dshProcess.kill('SIGTERM'); } catch { /* 已退出 */ }
+    }
+    const killer = setTimeout(() => {
+      try { process.kill(-pid, 'SIGKILL'); } catch { /* 已退出 */ }
+    }, 2000);
+    killer.unref();
   }
+  dshPid = null;
+  dshProcess = null;
 }
 
 // ── 全局异常捕获（防止静默退出）──
@@ -486,299 +397,92 @@ process.on('unhandledRejection', (reason) => {
 // ── 进程退出日志（记录退出码，便于排查）──
 process.on('exit', (code) => {
   // exit 事件里只能同步操作，直接写文件
-  try { fs.appendFileSync(WATCHDOG_LOG_FILE, `[${new Date().toISOString()}] relay 进程退出，exit code=${code}\n`); } catch {}
+  try { fs.appendFileSync(WATCHDOG_LOG_FILE, `[${new Date().toISOString()}] relay 进程退出，exit code=${code}\n`); } catch { /* 忽略 */ }
   console.log(`dsh-public-relay: 进程退出 (code=${code})`);
 });
 
 // ── 心跳定时器：确保事件循环永远不为空 ──
-// 即使 HTTP server 空闲、dsh web 没启动，心跳也能保持 Node 进程活着
 // 不调用 unref()，这样它就是一个强活引用，阻止 Node 自动退出
 setInterval(() => {
   // 空操作，仅保持事件循环活跃
-  // 如果觉得日志太多可以去掉，这里故意不输出
 }, 60_000);
 
-// 认证拦截：未登录时返回登录页 / 401；处理 /__login 提交
-function authGate(req, res, socket) {
-  if (!AUTH) return true;
-  const token = AUTH.parseCookies(req)[AUTH.cookieName];
-  if (AUTH.verifyToken(token)) return true;
+// ─────────────────────────── 中转（复用 lib/relay.js）───────────────────────────
 
-  // 登录提交
-  if (req.method === 'POST' && req.url === '/__login') {
-    let body = '';
-    let over = false;
-    req.on('data', (chunk) => {
-      body += chunk;
-      if (body.length > 16 * 1024) over = true;
-    });
-    req.on('end', () => {
-      if (over) {
-        if (res) { res.writeHead(413, { 'content-type': 'text/plain; charset=utf-8' }); res.end('payload too large'); }
-        return;
-      }
-      const input = new URLSearchParams(body).get('password') || '';
-      const ha = crypto.createHash('sha256').update(input).digest();
-      const hb = crypto.createHash('sha256').update(config.password).digest();
-      const ok = crypto.timingSafeEqual(ha, hb);
-      // 失败延时，拖慢暴力破解
-      setTimeout(() => {
-        if (!res.headersSent) {
-          if (ok) {
-            const exp = Date.now() + AUTH.COOKIE_TTL_MS;
-            res.writeHead(302, {
-              location: '/',
-              'set-cookie': `${AUTH.cookieName}=${AUTH.signToken(exp)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(AUTH.COOKIE_TTL_MS / 1000)}`,
-              'cache-control': 'no-store',
-            });
-            res.end();
-          } else {
-            const page = AUTH.LOGIN_PAGE.replace('__ERR__', '<div class="err">口令错误，请重试</div>');
-            res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-            res.end(page);
-          }
-        }
-      }, ok ? 0 : 400);
-    });
-    return false;
-  }
+const relayLib = path.join(__dirname, 'plugin', 'dsh-public-relay', 'lib', 'relay.js');
 
-  // 未登录
-  if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
-    const page = AUTH.LOGIN_PAGE.replace('__ERR__', '');
-    if (res) {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-      res.end(page);
-    }
-    return false;
-  }
-  if (res) {
-    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-    res.end('dsh-public-relay: 未登录（需要访问口令）。\n');
-  } else if (socket) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\ndsh-public-relay: 未登录（需要访问口令）');
-    socket.destroy();
-  }
-  return false;
+/**
+ * lib/relay.js 的 createRelay 要的是一个「已归一化的配置对象」与一个
+ * 「本进程 dsh 的端点」。本脚本两者都固定在命令行参数上，所以直接给回调。
+ *
+ * 注意 `allowOffHostTarget`：lib/config.js 的白名单重建里新增了这个开关，
+ * 漏掉它会静默变成 undefined（= false），于是任何非回环 --target 都会被
+ * 当成「配错了」而拒绝启动 —— 而用户是显式给了 --target 的。
+ */
+function relayConfig() {
+  return {
+    listenHost: config.host,
+    listenPort: config.port,
+    targetHost: TARGET.hostname,
+    targetPort: TARGET.port,
+    password: config.password,
+    forceLoopback: config.forceLoopback,
+    autoSession: false,        // 独立脚本没有 dsh 会话代签器
+    compressWebSocket: true,
+    allowOffHostTarget: true,  // 用户显式给了 --target，尊重之（见上文说明）
+  };
 }
 
-// ── 强制回环判定：bundle 改写 ──
-// DSH 依据 window.location.hostname 判定是否"本机回环"（127/localhost/[::1]），
-// 公网域名命中 false，导致设置平面降级为"memory"（插件配置显示为空）。
-// --force-loopback 启用时，拦截并改写 dsh-client-connection 的 client bundle，
-// 把 isLoopback 的判定改为 unconditionally true。
-
-const CONN_BUNDLE_PATHNAME = '/plugins/@deepseek-ai/dsh-client-connection/client.js';
-const LOOPBACK_REGEX = /isLoopback:\s+pageLocation === void 0 \|\| isLoopbackHostname\(pageLocation\.hostname\)/g;
-
-function shouldPatchBundle(req) {
-  if (!config.forceLoopback) return false;
-  try { return new URL(req.url, 'http://x').pathname === CONN_BUNDLE_PATHNAME; }
-  catch { return false; }
-}
-
-// 仅对目标 bundle 走缓冲代理，执行字节替换后返回
-function handlePatchedBundle(req, res) {
-  const t0 = Date.now();
-  const remote = req.socket.remoteAddress;
-  const headers = rewriteHeaders(req.headers, false, TARGET);
-  // 剥离压缩，保证上游返回明文，改写才能命中
-  delete headers['accept-encoding'];
-  headers['accept-encoding'] = 'identity';
-
-  const proxyReq = http.request({ ...UPSTREAM, method: req.method, path: req.url, headers, agent: false });
-  const timer = setTimeout(() => proxyReq.destroy(new Error('upstream connect timeout')), 15000);
-
-  proxyReq.on('response', (proxyRes) => {
-    clearTimeout(timer);
-    const status = proxyRes.statusCode;
-    const upstreamHeaders = stripHopByHop(proxyRes.headers);
-
-    // 非 200 或已压缩 → 原样透传（不改写），并记录
-    const encoding = (proxyRes.headers['content-encoding'] || '').toLowerCase();
-    if (status !== 200 || (encoding && encoding !== 'identity')) {
-      if (encoding && encoding !== 'identity') {
-        console.log(`[force-loopback] 上游响应已压缩 (${encoding})，已按原样透传`);
-      }
-      res.writeHead(status, proxyRes.statusMessage, upstreamHeaders);
-      proxyRes.pipe(res);
-      proxyRes.on('error', () => res.destroy());
-      log(req.method, req.url, status, remote, Date.now() - t0);
-      return;
-    }
-
-    // 收集 body
-    const chunks = [];
-    proxyRes.on('data', (c) => chunks.push(c));
-    proxyRes.on('end', () => {
-      const original = Buffer.concat(chunks);
-      let body = original.toString('utf-8');
-
-      // 字节替换：容忍空白漂移（正则）
-      const patched = body.replace(LOOPBACK_REGEX, 'isLoopback: true');
-
-      if (patched !== body) {
-        console.log(`[force-loopback] 已改写 bundle：${body.length} → ${patched.length} 字节`);
-        delete upstreamHeaders['content-length'];       // 长度已变
-        delete upstreamHeaders['transfer-encoding'];    // 用固定的 content-length
-        upstreamHeaders['content-length'] = Buffer.byteLength(patched, 'utf-8');
-        upstreamHeaders['cache-control'] = 'no-store';  // 避免跨次版本缓存混乱
-        res.writeHead(200, upstreamHeaders);
-        res.end(patched);
-      } else {
-        console.log('[force-loopback] 警告：未找到目标模式，可能 dsh 已升级，已按原样转发');
-        res.writeHead(status, upstreamHeaders);
-        res.end(original);
-      }
-      log(req.method, req.url, 200, remote, Date.now() - t0);
-    });
-    proxyRes.on('error', () => res.destroy());
-  });
-
-  proxyReq.on('error', (err) => {
-    clearTimeout(timer);
-    log(req.method, req.url, 502, remote, Date.now() - t0);
-    if (!res.headersSent) {
-      res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end(`relay: 无法连接上游 ${TARGET.origin}（${err.code || err.message}）。请确认 dsh web 已启动。\n`);
-    } else {
-      res.destroy();
-    }
-  });
-
-  req.on('error', () => proxyReq.destroy());
-  req.on('aborted', () => proxyReq.destroy());
-  res.on('error', () => proxyReq.destroy());
-  res.on('close', () => { if (!res.writableEnded && !proxyReq.destroyed) proxyReq.destroy(); });
-  req.pipe(proxyReq);
-}
-
-// ── HTTP 请求代理 ──
-function handleRequest(req, res) {
-  const t0 = Date.now();
-  const remote = req.socket.remoteAddress;
-  if (!authGate(req, res)) return;
-
-  // 命中目标 bundle → 走缓冲改写路径
-  if (shouldPatchBundle(req)) return handlePatchedBundle(req, res);
-
-  const headers = rewriteHeaders(req.headers, false, TARGET);
-  const proxyReq = http.request({ ...UPSTREAM, method: req.method, path: req.url, headers, agent: false });
-  const timer = setTimeout(() => proxyReq.destroy(new Error('upstream connect timeout')), 15000);
-
-  proxyReq.on('response', (proxyRes) => {
-    clearTimeout(timer);
-    res.writeHead(proxyRes.statusCode, proxyRes.statusMessage, stripHopByHop(proxyRes.headers));
-    proxyRes.pipe(res);
-    proxyRes.on('error', () => res.destroy());
-    log(req.method, req.url, proxyRes.statusCode, remote, Date.now() - t0);
-  });
-
-  proxyReq.on('error', (err) => {
-    clearTimeout(timer);
-    log(req.method, req.url, 502, remote, Date.now() - t0);
-    if (!res.headersSent) {
-      res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end(`relay: 无法连接上游 ${TARGET.origin}（${err.code || err.message}）。请确认 dsh web 已启动。\n`);
-    } else {
-      res.destroy();
-    }
-  });
-
-  req.on('error', () => proxyReq.destroy());
-  req.on('aborted', () => proxyReq.destroy());
-  res.on('error', () => proxyReq.destroy());
-  res.on('close', () => {
-    if (!res.writableEnded && !proxyReq.destroyed) proxyReq.destroy();
-  });
-  req.pipe(proxyReq);
-}
-
-// ── WebSocket upgrade 代理 ──
-function handleUpgrade(req, socket, head) {
-  const t0 = Date.now();
-  const remote = socket.remoteAddress;
-  // 先兜住客户端异常，避免 unhandled 'error' 崩溃
-  socket.on('error', () => socket.destroy());
-  if (!authGate(req, null, socket)) return;
-
-  const headers = rewriteHeaders(req.headers, true, TARGET);
-  const proxyReq = http.request({ ...UPSTREAM, method: 'GET', path: req.url, headers, agent: false });
-  const timer = setTimeout(() => proxyReq.destroy(new Error('upstream connect timeout')), 15000);
-
-  proxyReq.on('upgrade', (proxyRes, upstreamSocket, head2) => {
-    clearTimeout(timer);
-    const h = stripHopByHop(proxyRes.headers);
-    h.connection = 'Upgrade';
-    if (!h.upgrade) h.upgrade = 'websocket';
-    socket.write(`HTTP/1.1 101 Switching Protocols\r\n${serializeHeaders(h)}\r\n`);
-    if (head2 && head2.length) upstreamSocket.unshift(head2);
-    upstreamSocket.pipe(socket);
-    socket.pipe(upstreamSocket);
-    const kill = () => { upstreamSocket.destroy(); socket.destroy(); };
-    upstreamSocket.on('error', kill);
-    upstreamSocket.on('close', () => socket.destroy());
-    socket.on('close', () => upstreamSocket.destroy());
-    log(req.method, req.url, 101, remote, Date.now() - t0);
-  });
-
-  // 上游拒绝握手（如 403/502）：把状态码透传给客户端
-  proxyReq.on('response', (proxyRes) => {
-    clearTimeout(timer);
-    const status = proxyRes.statusCode || 502;
-    socket.write(`HTTP/1.1 ${status} ${proxyRes.statusMessage || ''}\r\n${serializeHeaders(stripHopByHop(proxyRes.headers))}\r\n`);
-    proxyRes.pipe(socket);
-    proxyRes.on('end', () => socket.end());
-    proxyRes.on('error', () => socket.destroy());
-    log(req.method, req.url, status, remote, Date.now() - t0);
-  });
-
-  proxyReq.on('error', (err) => {
-    clearTimeout(timer);
-    log(req.method, req.url, 502, remote, Date.now() - t0);
-    if (socket.writable) {
-      socket.write('HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nrelay: 无法连接上游 DSH Web（请确认 dsh web 已启动）');
-      socket.destroy();
-    }
-  });
-
-  proxyReq.end();
-}
-
-// ── 服务器装配与启动 ──
-const server = http.createServer(handleRequest);
-server.on('upgrade', handleUpgrade);
-server.on('clientError', (err, socket) => {
-  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
-  else socket.destroy();
-});
-
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`dsh-public-relay: 端口 ${config.port} 已被占用，换一个端口（--port）再试。`);
+async function main() {
+  let createRelay;
+  try {
+    ({ createRelay } = await import(pathToFileURL(relayLib).href));
+  } catch (err) {
+    console.error(`dsh-public-relay: 无法加载代理核心 ${relayLib}`);
+    console.error(`  ${err?.message || err}`);
+    console.error('  请确认 plugin/dsh-public-relay/lib/ 与本脚本在同一份分发里。');
     process.exit(1);
   }
-  throw err;
-});
 
-// 启动 dsh web 守护进程
-if (config.watchdog) {
-  try {
-    watchdogLog = fs.createWriteStream(WATCHDOG_LOG_FILE, { flags: 'a' });
-  } catch {}
-  startDshWeb();
-}
+  const relay = createRelay({
+    getDshEndpoint: () => ({ host: TARGET.hostname, port: TARGET.port }),
+    getConfig: relayConfig,
+    log: (level, message) => {
+      if (level === 'error') console.error(`[relay:${level}] ${message}`);
+      else if (level === 'warn') console.warn(`[relay:${level}] ${message}`);
+      else console.log(`[relay] ${message}`);
+    },
+    // 独立脚本没有 dsh 会话上下文，sessionSigner 留空即可。
+  });
 
-server.listen(config.port, config.host, () => {
-  const addr = server.address();
-  const port = typeof addr === 'object' && addr ? addr.port : config.port;
+  if (config.watchdog) {
+    try {
+      watchdogLog = fs.createWriteStream(WATCHDOG_LOG_FILE, { flags: 'a' });
+    } catch { /* 日志文件打不开也不该阻止启动 */ }
+    startDshWeb();
+  }
+
+  const st = await relay.start();
+  if (st.state === 'error') {
+    console.error(`dsh-public-relay: 中转启动失败（${st.lastError}）`);
+    console.error(`dsh-public-relay: 监听 ${config.host}:${config.port} → ${TARGET.origin}`);
+    if (st.lastError === 'port-in-use') {
+      console.error('dsh-public-relay: 端口已被占用，换一个端口（--port）再试。');
+    }
+    if (st.lastError === 'off-host-target') {
+      console.error('dsh-public-relay: --target 指向回环之外的主机，插件库默认拒绝。');
+    }
+    process.exit(1);
+  }
+
+  const port = st.listen.port;
   console.log('────────────────────────────────────────────────────────────');
   console.log(`dsh-public-relay: 中转监听 ${config.host}:${port}，转发到 ${TARGET.origin}`);
   console.log(`dsh-public-relay: 樱花映射 TCP 隧道的「本地端口」请填 ${port}`);
   if (config.watchdog) {
-    console.log(`dsh-public-relay: dsh web 守护已启动（崩溃自动重启，日志：dsh-web.log）`);
+    console.log('dsh-public-relay: dsh web 守护已启动（崩溃自动重启，日志：dsh-web.log）');
   }
-  if (AUTH) {
+  if (config.password) {
     if (generatedPassword !== null) {
       console.log(`dsh-public-relay: 访问口令（本次随机生成）: ${config.password}`);
       console.log('dsh-public-relay: 记下它；下次用 --password 或 DSH_RELAY_PASSWORD 复用同一个口令');
@@ -790,23 +494,32 @@ server.listen(config.port, config.host, () => {
     console.log('dsh-public-relay: 已启用 force-loopback（公网可看插件列表，Ctrl+F5 硬刷新生效）');
   }
   console.log('────────────────────────────────────────────────────────────');
-});
 
-let isShuttingDown = false;
-function shutdown() {
-  if (isShuttingDown) return;  // 防止重复调用
-  isShuttingDown = true;
-  watchdogLogLine('收到关闭信号，正在清理...');
-  stopDshWeb();
-  server.close(() => {
+  // ── 关闭 ──
+  let isShuttingDown = false;
+  async function shutdown() {
+    if (isShuttingDown) return;   // 防止重复调用
+    isShuttingDown = true;
+    watchdogLogLine('收到关闭信号，正在清理...');
+    stopDshWeb();
+    // 兜底强退：relay.stop() 自带 2 秒 drain，正常会先结束。
+    // 这个定时器**只能**在关闭流程里挂 —— 之前它被无条件挂在 main() 末尾，
+    // 于是每次启动 3 秒后就把整个中转强退了（.unref() 只是不让它撑住事件
+    // 循环，并不会阻止它到点触发）。症状极难定位：启动信息一切正常，
+    // 端口也确实在监听，然后进程安静地自己没了。
+    const bail = setTimeout(() => { try { process.exit(0); } catch { /* 已退出 */ } }, 3000);
+    bail.unref();
+    await relay.stop().catch(() => { /* 停止中转失败也要退出 */ });
     watchdogLogLine('relay 已关闭，退出');
     process.exit(0);
-  });
-  // 3 秒兜底强退
-  setTimeout(() => { try { process.exit(0); } catch {} }, 3000).unref();
+  }
+  process.on('SIGINT', () => { void shutdown(); });
+  process.on('SIGTERM', () => { void shutdown(); });
+  // Windows: 关闭窗口时也会触发
+  process.on('SIGHUP', () => { void shutdown(); });
 }
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
 
-// Windows: 关闭窗口时也会触发
-process.on('SIGHUP', shutdown);
+main().catch((err) => {
+  console.error(`dsh-public-relay: 启动失败：${err?.stack || err}`);
+  process.exit(1);
+});

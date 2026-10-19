@@ -15,6 +15,15 @@
  *   · 路由用 `ctx.effect(() => ctx.webServer.register(...))` 持有，卸载即注销。
  *   · 工具定义直接写成 ToolDefinition（不 import `@deepseek-ai/dsh-tools`），
  *     少一个可能解析失败的依赖；`defineTool` 只是语法糖。
+ *
+ * 0.2.3 安全加固：管理路由（/config、/control）增加鉴权
+ *   · 原本唯一的门禁是 `isTrustedWrite` 的 Origin 嗅探，而中转在 rewriteHeaders
+ *     里会把 Host / Origin 一起改写成上游回环权威 —— 任何经中转进来的管理
+ *     请求都按构造「同源」。那个判据挡得住跨站网页，挡不住持有中转口令
+ *     （或根本没口令）的任何客户端。现在要求 bearer token / relay_session
+ *     cookie，口令为空时只允许回环对端。
+ *   · `isTrustedWrite` 本身也收紧：缺 Origin 不再无条件放行（改为「回环对端
+ *     才放行」），`dsh-app://` 改为精确匹配而非前缀匹配。
  */
 'use strict';
 
@@ -24,6 +33,7 @@ import os from 'node:os';
 
 import { createRelay } from './relay.js';
 import { createSessionSigner } from './dsh-cookie.js';
+import { isAdminRequest, isLoopbackPeer, makeAuth } from './auth.js';
 import {
   CONFIG_FILENAME, DEFAULTS, diffFromDefaults, normalizeConfig, toStorable,
 } from './config.js';
@@ -49,26 +59,60 @@ function sendJson(response, status, payload) {
   response.end(JSON.stringify(payload));
 }
 
+/** Electron 自渲染页面的私有 scheme。精确匹配，不用前缀。 */
+const DSH_APP_ORIGIN = 'dsh-app://app';
+
 /**
- * 决定一个**会改状态**的请求是否可信（CSRF 防护）。
+ * 决定一个**会改状态**的请求是否同源（CSRF 防护，与 `isAdminRequest` 互补）。
  *
- * 与 dsh 自己的 `isTrustedApiRequest` 同构：
- *   ① 无 Origin → 放行（浏览器对跨站写请求必带 Origin）
- *   ② `dsh-app://` → 放行（Electron 自渲染页面的私有 scheme，网页伪造不出来）
- *   ③ http(s) → Origin 必须与 Host 同 authority
- * 无 Host 一律拒绝。
+ * 它只回答「这是不是跨站来的」，**不回答「调用者有没有权限」** —— 后者由
+ * `isAdminRequest` 负责。两者都要过。
+ *
+ * 与旧版（isTrustedApiRequest 同构）的三处收紧：
+ *
+ *   ① **缺 Origin 不再无条件放行**。旧实现「无 Origin → 放行」，理由是浏览器
+ *      对跨站写请求必带 Origin。但那只约束浏览器 —— curl、脚本、SSRF、
+ *      WebView 全都可以不带 Origin 而畅通无阻。现在：缺 Origin 时，只有
+ *      **回环对端**放行（本机 curl 仍可用），其余 403。
+ *   ② `dsh-app://` 改为**精确匹配** `dsh-app://app`。前缀匹配会接受
+ *      `dsh-app://evil` 这类网页伪造不出的字符串（HTTP 头里可以随便写）。
+ *   ③ 无 Host 一律拒绝（保留）。
+ *
+ * http(s) 仍要求 Origin 与 Host 同 authority。
  */
 function isTrustedWrite(request) {
-  const host = request.headers.host;
-  if (host === undefined) return false;
+  if (request.headers.host === undefined) return false;
   const origin = request.headers.origin;
-  if (origin === undefined) return true;
-  if (typeof origin === 'string' && origin.startsWith('dsh-app://')) return true;
+  // ① 无 Origin：只放过本机客户端
+  if (origin === undefined) return isLoopbackPeer(request);
+  if (origin === DSH_APP_ORIGIN) return true;   // ② 精确匹配
   try {
-    return new URL(origin).host === host;
+    return new URL(origin).host === request.headers.host;   // ③ 同 authority
   } catch {
     return false;
   }
+}
+
+/**
+ * 管理路由（/config、/control）的鉴权。
+ *
+ * 通过条件（二者之一）：
+ *   · 持有中转口令：bearer token 或 relay_session cookie 校验通过；
+ *   · **口令为空**：只允许回环对端。
+ *
+ * 为什么要 bearer：口径很直白 —— **持有中转口令即持有管理权限**。中转口令
+ * 本来就是唯一那道边界，管理路由没有理由比数据面更宽松；而 bearer 由口令
+ * HMAC 派生，持有者只有本地工具/CLI 与已登录浏览器（口令是 write-only 的，
+ * 浏览器端拿不到原值，也就没法自己造一个）。
+ *
+ * 口令为空时 `makeAuth('')` 返回 null，bearer/cookie 都无从校验，于是退化为
+ * 「仅回环」。含义要说清楚：**这不等于「无认证开放」** —— 监听在 0.0.0.0 时
+ * 非回环客户端同样 403，配置面不会因为忘记设口令就彻底裸露在本机之外。
+ */
+function isAuthorizedAdmin(request, password) {
+  const auth = makeAuth(password);
+  if (auth !== null && isAdminRequest(request, auth)) return true;
+  return auth === null && isLoopbackPeer(request);
 }
 
 /** 带体积上限的 JSON body 读取。 */
@@ -200,46 +244,85 @@ export function apply(ctx, entryConfig) {
   // ── 中转实例 ──
   const relay = createRelay({ getDshEndpoint, getConfig: readConfig, log, sessionSigner });
 
-  /** 配置变化时联动中转：开关与监听参数是仅有的两处需要动作的。 */
+  /**
+   * 配置变化时联动中转。
+   *
+   * 只有「开关」与「监听参数」需要动监听器；其余字段（口令、autoSession、
+   * forceLoopback、compressWebSocket）都是**请求期热读**的 —— relay 的
+   * `cfg()` 每次请求都重新调用 `getConfig()`，所以不需要重启。
+   *
+   * 这里的 key 只用来跳过「没有实际变化」的重复 reconcile。它只包含
+   * 影响监听的字段，是**正确的**：别的字段改了却重启中转，反而会踢掉所有
+   * 在线连接。口令热生效这一点由 relay 内的 `authCache`（按 password 值
+   * 重新派生）保证，已在测试里覆盖。
+   *
+   * 并发保护：reconcile 可能被 HTTP 路由与启动定时器同时触发，用一个
+   * 串行链避免两次 start/stop 交错（否则会出现「stop 把刚起来的监听又拆了」）。
+   */
   let lastApplied = null;
-  async function reconcile(reason) {
-    const cfg = readConfig();
-    const st = relay.status();
-    const key = `${cfg.enabled}|${cfg.listenHost}|${cfg.listenPort}`;
-    if (key === lastApplied) return;
-    try {
-      if (!cfg.enabled) {
-        if (st.state === 'running') {
+  let reconcileChain = Promise.resolve();
+  function reconcile(reason) {
+    const run = async () => {
+      const cfg = readConfig();
+      const st = relay.status();
+      const key = `${cfg.enabled}|${cfg.listenHost}|${cfg.listenPort}`;
+      if (key === lastApplied) return;
+      try {
+        if (!cfg.enabled) {
+          if (st.state === 'running') {
+            await relay.stop();
+            log('info', `配置变更（${reason}）：中转已停止`);
+          }
+        } else if (st.state !== 'running') {
+          const started = await relay.start();
+          log('info', `配置变更（${reason}）：中转 ${started.state === 'running' ? '已启动' : '启动失败 ' + (started.lastError || '')}`);
+        } else if (cfg.listenHost !== st.listen.host || cfg.listenPort !== st.listen.port) {
           await relay.stop();
-          log('info', `配置变更（${reason}）：中转已停止`);
+          const started = await relay.start();
+          log('info', `配置变更（${reason}）：中转已按新监听参数重启（${started.state}）`);
         }
-      } else if (st.state !== 'running') {
-        const started = await relay.start();
-        log('info', `配置变更（${reason}）：中转 ${started.state === 'running' ? '已启动' : '启动失败 ' + (started.lastError || '')}`);
-      } else if (cfg.listenHost !== st.listen.host || cfg.listenPort !== st.listen.port) {
-        await relay.stop();
-        const started = await relay.start();
-        log('info', `配置变更（${reason}）：中转已按新监听参数重启（${started.state}）`);
+        lastApplied = key;
+      } catch (err) {
+        log('error', `同步中转状态失败：${err?.message || err}`);
       }
-    } catch (err) {
-      log('error', `同步中转状态失败：${err?.message || err}`);
-    }
-    lastApplied = key;
+    };
+    // 排队执行，保证同一时刻只有一次 start/stop 在跑
+    reconcileChain = reconcileChain.then(run, run);
+    return reconcileChain;
   }
 
-  /** 组装给 UI 的完整状态。 */
+  /**
+   * 组装给 UI 的完整状态。
+   *
+   * **口令绝不出现在这里。**
+   *
+   * 这个快照同时通过 `/dsh-public-relay/status` 返回给任何能访问中转的客户端
+   * （而中转就是暴露在公网上的那一面）。旧实现直接把整份 config 展开，
+   * 于是 `GET /status` 就把明文口令吐了出来 —— 口令又是唯一边界，
+   * 等于一次读请求换来永久完全控制。现在只暴露 `hasPassword` 布尔值，
+   * 口令的「写」走独立的 write-only 通道（见 writeConfig 的 password 处理）。
+   */
   function snapshot() {
     const status = relay.status();
     const dsh = getDshEndpoint();
     const config = readConfig();
     const session = sessionSigner.status();
+    // 脱敏：只保留「有没有设口令」，不提供任何形式的还原
+    const { password: _password, ...publicConfig } = config;
     return {
       ...status,
       dshPort: dsh.port,
       dshAddress: status.dsh?.address ?? null,
-      config,
-      defaults: DEFAULTS,
-      overrides: diffFromDefaults(config),
+      config: publicConfig,
+      hasPassword: Boolean(config.password),
+      defaults: (() => {
+        const { password: _dp, ...rest } = DEFAULTS;
+        return rest;
+      })(),
+      overrides: (() => {
+        const { password: _op, ...rest } = diffFromDefaults(config);
+        return rest;
+      })(),
       configFile,
       session: {
         ...session,
@@ -276,8 +359,45 @@ export function apply(ctx, entryConfig) {
   }
 
   /** 写配置：归一化 → 落盘 → 联动中转。 */
+  /**
+   * 写配置：归一化 → 落盘 → 联动中转。
+   *
+   * **口令是 write-only 的**（因为 status 不再返回它，UI 也拿不到原值）：
+   *   · 请求里不带 `password` 字段   → 保持原口令不变
+   *   · 带 `password: ""`            → 明确清空（关闭认证）
+   *   · 带 `password: "new"`          → 设为新口令
+   *
+   * 之所以要区分「不带」与「空串」：UI 的输入框永远是空的（不回填），
+   * 若把「空」当成「清空」，用户每次保存其他设置都会把自己的口令清掉。
+   */
   async function writeConfig(patch) {
-    const candidate = normalizeConfig({ ...toStorable(readConfig()), ...patch });
+    const source = patch !== null && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
+    const merged = { ...toStorable(readConfig()) };
+
+    /**
+     * 先剥离原型污染键，再做任何赋值。
+     *
+     * `JSON.parse` 会把 `{"__proto__":{...}}` 建成一个**自有属性**，于是
+     * `Object.assign` 会触发 `Object.prototype` 上的 `__proto__` setter ——
+     * 这是本函数里唯一一处「把外部对象灌进原型链」的机会。
+     *
+     * 目前没有可利用的后果：随后的 normalizeConfig 会按固定形状重建一个全新
+     * 对象，被污染的原型不会活到落盘。但那依赖的是「下游恰好会重建」这个
+     * 间接事实 —— 一旦以后有人改成透传某个字段，防护就无声消失了。
+     * 按纵深防御在这里挡掉，成本是三行。
+     */
+    const rest = {};
+    for (const [key, value] of Object.entries(source)) {
+      if (key === 'password' || key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+      rest[key] = value;
+    }
+    Object.assign(merged, rest);
+    // 只有显式出现 password 字段时才改口令（长度夹取由 normalizeConfig 统一做，
+    // 所以这里必须排在剥离之后：不能因为键被过滤就漏掉口令更新）。
+    if (Object.hasOwn(source, 'password')) {
+      merged.password = typeof source.password === 'string' ? source.password : String(source.password ?? '');
+    }
+    const candidate = normalizeConfig(merged);
     current = candidate;
     const persisted = saveConfig(candidate);
     lastApplied = null;   // 强制 reconcile 走一遍
@@ -316,12 +436,10 @@ export function apply(ctx, entryConfig) {
             response.end();
             return;
           }
-          if (!isTrustedWrite(request)) {
-            return sendJson(response, 403, {
-              ok: false,
-              error: 'untrusted origin',
-              detail: `origin=${JSON.stringify(request.headers.origin ?? null)} host=${JSON.stringify(request.headers.host ?? null)}`,
-            });
+          if (!isTrustedWrite(request) || !isAuthorizedAdmin(request, readConfig().password)) {
+            // 响应体不回显 origin/host 原值（见 task-5 的同类清理）：
+            // 头值是攻击者可控的，回显只会变成一个 header 反射预言机。
+            return sendJson(response, 403, { ok: false, error: 'forbidden' });
           }
           const body = await readJsonBody(request);
           const result = await control(typeof body.action === 'string' ? body.action : 'status');
@@ -335,19 +453,19 @@ export function apply(ctx, entryConfig) {
             response.end();
             return;
           }
-          if (!isTrustedWrite(request)) {
-            return sendJson(response, 403, {
-              ok: false,
-              error: 'untrusted origin',
-              detail: `origin=${JSON.stringify(request.headers.origin ?? null)} host=${JSON.stringify(request.headers.host ?? null)}`,
-            });
+          if (!isTrustedWrite(request) || !isAuthorizedAdmin(request, readConfig().password)) {
+            return sendJson(response, 403, { ok: false, error: 'forbidden' });
           }
           const body = await readJsonBody(request);
           const patch = body.config && typeof body.config === 'object' ? body.config : {};
           return sendJson(response, 200, await writeConfig(patch));
         }
 
-        return sendJson(response, 404, { ok: false, error: `unknown dsh-public-relay route: ${route}` });
+        // 未知子路由：不回显 route 原值。
+        // route 派生自 request.url，是攻击者完全可控的输入；回显它只会把这个
+        // 端点变成一个反射预言机，且响应体随输入无界增长。固定文案即可 ——
+        // 调用方拿到 404 已经知道是哪条路由。
+        return sendJson(response, 404, { ok: false, error: 'unknown route' });
       } catch (error) {
         const message = error?.message || String(error);
         log('error', `路由 ${route} 出错：${message}`);

@@ -51,6 +51,20 @@ const DEFAULT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** 复查密钥文件的时间间隔（dsh 重建记录时能自动跟上）。 */
 const SECRET_RECHECK_MS = 30 * 1000;
 
+/**
+ * 旧密钥的兜底有效期：10 分钟。
+ *
+ * 存在的理由：refresh() 读不到文件时**保留旧密钥**（文件被临时截断不该立刻
+ * 让人掉线）。但「保留」不该无限期 —— 否则一次永久性的读取失败会被静默掩盖，
+ * 代签会继续用一把可能已经作废的密钥签会话。
+ *
+ * 正常情况下永远走不到这里：文件一直可读，refresh 每 SECRET_RECHECK_MS 刷一次
+ * （30 秒），远小于这个 TTL。只有「连续 10 分钟都读不到」才会翻转，翻转后
+ * 退回现状（不再代签、需要 `?token=` 登录）—— 是安全的降级，不会造成
+ * 「dsh 长时间运行后所有人突然掉线」。
+ */
+const SECRET_STALE_TTL_MS = 10 * 60 * 1000;
+
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]*$/;
 
 /** 与 dsh 的 encodeBase64Url 等价（去掉尾部的 = 填充）。 */
@@ -204,6 +218,8 @@ export function createSessionSigner(options = {}) {
   let loadedAt = 0;
   let lastError = null;
   let lastMtimeMs = 0;
+  /** 最近一次**成功读到**密钥的时刻（stale TTL 的起算点）。 */
+  let lastGoodReadAt = 0;
 
   /**
    * 读/刷新密钥。带 mtime 检查，避免每个请求都碰磁盘。
@@ -232,6 +248,7 @@ export function createSessionSigner(options = {}) {
       secret = parsed;
       lastMtimeMs = st.mtimeMs;
       loadedAt = now;
+      lastGoodReadAt = now;      // 成功读到 → stale TTL 重新起算
       lastError = null;
       return true;
     } catch (err) {
@@ -245,23 +262,50 @@ export function createSessionSigner(options = {}) {
     }
   }
 
+  /**
+   * 当前密钥是否**仍然可用**（含 stale TTL 判定）。
+   *
+   * 与 refresh() 的区别：refresh() 回答「能不能读到文件」，usable() 回答
+   * 「这把密钥还该不该继续用」。读不到文件时旧密钥被保留（避免瞬时掉线），
+   * 但超过 SECRET_STALE_TTL_MS 仍未成功读到就不再认为它可用。
+   */
+  function usable() {
+    if (secret === null) return false;
+    if (lastGoodReadAt !== 0 && Date.now() - lastGoodReadAt >= SECRET_STALE_TTL_MS) {
+      return false;
+    }
+    return true;
+  }
+
   /** 状态快照，供 UI/诊断显示。会按需触发一次加载，避免首次调用误报 ready:false。 */
   function status() {
     // 没用过就先尝试加载一次：否则 UI 上会短暂显示「未就绪」，
     // 让人误以为密钥读不到。
     if (secret === null) refresh();
+    // 密钥已过期时也重读一次：此时 lastError 才会有内容，UI 才能告诉用户
+    // 「为什么不能代签」（凭据文件读不到了）。平时不会走到这条分支。
+    if (secret !== null && !usable()) refresh(true);
+    const ok = usable();
     return {
-      ready: secret !== null,
+      ready: ok,
       hasSecret: secret !== null,
       lastError,
-      credentialsFile,
+      /**
+       * **只给文件名**，不给绝对路径。
+       *
+       * 这个快照经 `/dsh-public-relay/status` 与 `relay_status` 工具暴露，
+       * 而中转就是面向公网的那一面 —— 完整路径会泄露 $DSH_HOME / 操作系统
+       * 用户名布局。排查时 basename 已经够用（约定文件名是固定的
+       * `.credentials.yaml`），定位问题靠它并不会更困难。
+       */
+      credentialsFile: path.basename(credentialsFile),
       maxAgeMs,
     };
   }
 
   /** 浏览器已带的一个 cookie 是否仍被 dsh 认可（避免重复注入）。 */
   function isValidFor(authority, value) {
-    if (secret === null) return false;
+    if (!usable()) return false;
     const payload = decodeCookie(value, secret);
     if (payload === undefined) return false;
     const now = Date.now();
@@ -282,8 +326,22 @@ export function createSessionSigner(options = {}) {
    *   · injected=false → cookieHeader 原样返回（已有可用 cookie，或签不出来）
    */
   function checkout(authority, existingCookieHeader) {
-    if (!refresh()) {
-      return { cookieHeader: existingCookieHeader, name: null, injected: false, reason: lastError || 'no-secret' };
+    const ok = refresh();
+    if (!ok || !usable()) {
+      // refresh() 成功但密钥已 stale：同样不注入。
+      // 退化行为是「不再代签、需要 ?token= 登录」，而不是用一把可能已作废的
+      // 密钥继续签会话 —— 后者会让所有在线用户拿着一个 dsh 不认的 cookie。
+      //
+      // 原因要能区分「压根没有密钥」与「有过但已过期」：后者是运维需要知道的
+      // 状态（该去查 credentials 文件），前者只是功能未启用。所以 stale 的
+      // 判定优先于 lastError —— 文件读不到时 lastError 必然非空。
+      const stale = ok && secret !== null;
+      return {
+        cookieHeader: existingCookieHeader,
+        name: null,
+        injected: false,
+        reason: stale ? 'stale-secret' : (lastError || 'no-secret'),
+      };
     }
     const name = cookieNameFor(authority);
     const existing = readCookieValue(existingCookieHeader, name);

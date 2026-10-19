@@ -23,6 +23,10 @@ desktop.ini
 *.pid
 *.bak
 
+# 安全审查过程产物：探针脚本、变异体副本、沙箱（8MB / 875 文件）。
+# 结论已固化进 tests/ 与 tools/audit-*.mjs，这些中间产物不入库。
+review/
+
 # 本地开发用的模块解析链接（指向 dsh 的 node_modules，仅测试便利，不入库）
 # 注：上面的通用 `node_modules/` 规则已覆盖它；这里显式写出只为可读性
 plugin/dsh-public-relay/node_modules/

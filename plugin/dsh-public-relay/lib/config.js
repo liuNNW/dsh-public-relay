@@ -34,6 +34,25 @@ export const CONFIG_VERSION = 1;
 export const CONFIG_FILENAME = 'dsh-public-relay.json';
 
 /**
+ * 默认允许作为上游的主机名。
+ *
+ * 「代理另一个 dsh 实例」是文档承认的合法场景，但它意味着中转可以变成一个
+ * 把任意请求转发到任意 host:port 的正向代理 —— 而 `targetHost` 是配置项。
+ * 默认只认回环；跨主机必须由用户**显式知情**地打开 `allowOffHostTarget`。
+ */
+export const LOOPBACK_TARGET_HOSTS = Object.freeze([
+  '127.0.0.1',
+  'localhost',
+  '::1',
+  '[::1]',
+]);
+
+/** 判断一个 targetHost 是否在默认回环名单内。 */
+export function isLoopbackTargetHost(host) {
+  return LOOPBACK_TARGET_HOSTS.includes(String(host).trim().toLowerCase());
+}
+
+/**
  * 静态默认值。
  *
  * 与 normalizeConfig 的兜底必须一致，UI 直接用这份常量渲染「恢复默认」。
@@ -56,6 +75,18 @@ export const DEFAULTS = Object.freeze({
   targetHost: '',
   /** 上游端口覆盖；0 = 自动。 */
   targetPort: 0,
+  /**
+   * 允许把上游指到**回环之外**的主机。
+   *
+   * 默认 false：targetHost 只能落在 LOOPBACK_TARGET_HOSTS 里，否则中转直接
+   * 拒绝启动（state=error，lastError='off-host-target'）。这样「忘记配错
+   * targetHost」不会悄悄把中转变成一个指向内网/云元数据地址的正向代理。
+   *
+   * 刻意做成**开关**而不是硬拒绝：文档承认的「代理另一个 dsh 实例」场景
+   * （另一个实例跑在另一台机器/另一个容器网络里）必须仍然可用，而开关把这个
+   * 决定显式地交回给知情用户 —— 状态里也会带 targetIsOffHost 便于排查。
+   */
+  allowOffHostTarget: false,
   /**
    * 强制回环改写：把客户端 bundle 里的 `isLoopback` 判定改成恒真，
    * 让经隧道访问时 dsh 仍认为自己是本机（否则设置平面会降级为 memory，
@@ -94,6 +125,16 @@ function clampInt(value, min, max, fallback) {
 }
 
 /**
+ * 访问口令的最大字符数。
+ *
+ * 为什么不设上限会是问题：口令会原样落进 `dsh-public-relay.json`，也会被
+ * HMAC 派生（读一遍 O(n)），而它在配置面是可任意提交的字段。没有上界就等于
+ * 给了一个「往配置里塞几 MB 字符串」的低成本放大器。512 字符对人类可记忆的
+ * 口令绰绰有余（远超任何有意义的口令熵）。
+ */
+export const MAX_PASSWORD_LENGTH = 512;
+
+/**
  * 归一化一份配置：类型收敛、范围夹取、未知键丢弃。
  *
  * @param raw - 任意来源的原始值（文件内容 / Loader 的 entry config / 请求体）。
@@ -110,7 +151,11 @@ export function normalizeConfig(raw) {
   // 端口 0 允许：让 OS 分配，UI 上显示真实分配值。
   const listenPort = clampInt(src.listenPort, 0, 65535, DEFAULTS.listenPort);
 
-  const password = typeof src.password === 'string' ? src.password : String(src.password ?? '');
+  const passwordRaw = typeof src.password === 'string' ? src.password : String(src.password ?? '');
+  // 超长口令夹取。是否真的被夹过要能被观察到 —— 否则用户填了 1000 字符却
+  // 以为生效了，实际只有前 512 个在起作用，登录失败时会完全摸不着头脑。
+  const password = passwordRaw.slice(0, MAX_PASSWORD_LENGTH);
+  const passwordTruncated = password.length !== passwordRaw.length;
 
   const rawTargetHost = src.targetHost;
   const targetHost = typeof rawTargetHost === 'string' && rawTargetHost.trim() !== ''
@@ -120,6 +165,9 @@ export function normalizeConfig(raw) {
   // 上游端口 0 没有意义 —— 归一为 null，走「自动取本进程 dsh 端口」。
   const targetPortNum = clampInt(src.targetPort, 0, 65535, 0);
   const targetPort = targetPortNum > 0 ? targetPortNum : null;
+
+  // 目标是否落在回环之外（仅用于状态展示与 relay 的启动闸门，不在此处强制）。
+  const targetIsOffHost = targetHost !== null && !isLoopbackTargetHost(targetHost);
 
   /**
    * 自动会话代签：口令为空时**强制关闭**。
@@ -136,7 +184,12 @@ export function normalizeConfig(raw) {
     listenPort,
     targetHost,
     targetPort,
+    targetIsOffHost,
+    allowOffHostTarget: src.allowOffHostTarget === true,
     password,
+    passwordTruncated,
+    /** 原本多长 —— 让 UI 能说清「1000 → 512」而不是只报一个错误。 */
+    passwordRawLength: passwordRaw.length,
     forceLoopback: src.forceLoopback !== false,
     autoSession,
     compressWebSocket: src.compressWebSocket !== false,
@@ -175,6 +228,8 @@ export function toStorable(config) {
     listenPort: config.listenPort,
     targetHost: config.targetHost ?? '',
     targetPort: config.targetPort ?? 0,
+    // 跨主机是显式知情的开关，必须能原样往返
+    allowOffHostTarget: config.allowOffHostTarget === true,
     password: config.password,
     forceLoopback: config.forceLoopback,
     // 存「用户原意」，生效与否每次由 normalizeConfig 判。

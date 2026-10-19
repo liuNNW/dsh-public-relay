@@ -13,8 +13,8 @@ import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
-import { createRelay, patchIsLoopback, isLoopbackPatchTarget } from '../dsh-public-relay/lib/relay.js';
-import { normalizeConfig, DEFAULTS } from '../dsh-public-relay/lib/config.js';
+import { createRelay, patchIsLoopback, isLoopbackPatchTarget, loginKeyOf, decodeBody, encodeBody } from '../dsh-public-relay/lib/relay.js';
+import { normalizeConfig, DEFAULTS, toStorable, isLoopbackTargetHost } from '../dsh-public-relay/lib/config.js';
 
 // ── 整体超时保险 ──
 // 若测试因句柄挂起而无法推进，Node 会在无活动句柄时静默退出、退出码停在默认 0，
@@ -636,6 +636,230 @@ async function main() {
     const retry = await relay.start();
     check('占用解除后能正常启动', retry.state === 'running', `got ${retry.state} / ${retry.lastError}`);
     await relay.stop();
+  }
+
+  section('登录限流：伪造 X-Forwarded-For 无法重置计数');
+  {
+    // ── 回归锁（0.2.3）──
+    //
+    // 旧 loginKeyOf 优先取 x-forwarded-for 的**第一项**，而那完全是请求方自己
+    // 写的：每换一个伪造 IP 就等于换了一个新计数器，滑动窗口形同虚设，在线
+    // 爆破速率 = 网络带宽。修法见 auth.js：默认只信 socket.remoteAddress，
+    // 且仅当直连对端本身就是回环时才读 XFF（并取最后一项）。
+    //
+    // 关键在于「对端非回环」这一条 —— 那正是公网直连 / 隧道暴露的形态。本机
+    // 自测的连接来自 127.0.0.1，按设计会被当作反代而采信 XFF，所以下面这
+    // 组用假 socket 直接测取键逻辑，那才是真正被堵住的旁路。
+
+    const mkReq = (remoteAddress, xff) => ({
+      socket: { remoteAddress },
+      headers: xff === undefined ? {} : { 'x-forwarded-for': xff },
+    });
+
+    // ① 非回环对端 + 伪造 XFF → 必须忽略 XFF，一律按 socket 地址归并
+    check('非回环对端：无 XFF 时键就是 socket 地址',
+      loginKeyOf(mkReq('203.0.113.5')) === '203.0.113.5', loginKeyOf(mkReq('203.0.113.5')));
+    check('非回环对端：伪造 XFF 被忽略（键不变）',
+      loginKeyOf(mkReq('203.0.113.5', '10.0.0.1')) === '203.0.113.5',
+      loginKeyOf(mkReq('203.0.113.5', '10.0.0.1')));
+    check('非回环对端：换伪造 XFF 也换不掉键（限流不可被重置）',
+      loginKeyOf(mkReq('203.0.113.5', '10.0.0.1'))
+        === loginKeyOf(mkReq('203.0.113.5', '10.0.0.9')),
+      '键被伪造头带偏了');
+
+    // ② 回环对端（确实有隧道/反代在中间）→ 才采信 XFF，且取**最后一项**
+    check('回环对端：采信 XFF 的最后一项（正向代理追加链尾）',
+      loginKeyOf(mkReq('127.0.0.1', '203.0.113.7, 198.51.100.4')) === '198.51.100.4',
+      loginKeyOf(mkReq('127.0.0.1', '203.0.113.7, 198.51.100.4')));
+    check('回环对端：单值 XFF 正常取用',
+      loginKeyOf(mkReq('127.0.0.1', '198.51.100.4')) === '198.51.100.4',
+      loginKeyOf(mkReq('127.0.0.1', '198.51.100.4')));
+    check('回环对端：XFF 为空白串时回落到 socket',
+      loginKeyOf(mkReq('127.0.0.1', '  ,  ')) === '127.0.0.1',
+      loginKeyOf(mkReq('127.0.0.1', '  ,  ')));
+
+    // ③ 端到端：同一个 XFF 连打 8 次错误口令 → 第 9 次必须 429
+    const xffPort = await freePort();
+    const xffRelay = createRelay({
+      getDshEndpoint: () => ({ host: '127.0.0.1', port: upstream.port }),
+      getConfig: () => normalizeConfig({
+        listenPort: xffPort, password: 'xff-pass', forceLoopback: false,
+      }),
+      log: () => {},
+    });
+    await xffRelay.start();
+
+    const badLogin = (xff) => request(xffPort, '/__login', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        ...(xff === undefined ? {} : { 'x-forwarded-for': xff }),
+      },
+      body: 'password=wrong',
+    });
+
+    for (let i = 0; i < 8; i += 1) await badLogin('198.51.100.4');
+    const ninth = await badLogin('198.51.100.4');
+    check('同一来源第 9 次 → 429', ninth.status === 429, `got ${ninth.status}`);
+
+    // 限流窗口内正确口令同样被拒（限流优先于读 body，这是有意的）
+    const goodDuringLimit = await request(xffPort, '/__login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-forwarded-for': '198.51.100.4' },
+      body: 'password=xff-pass',
+    });
+    check('限流窗口内正确口令也 429（防爆破优先）', goodDuringLimit.status === 429,
+      `got ${goodDuringLimit.status}`);
+
+    // 另一个来源不受牵连（按来源分别计数）
+    const otherSource = await badLogin('198.51.100.5');
+    check('另一个来源不受牵连', otherSource.status === 401, `got ${otherSource.status}`);
+
+    // ④ 换一个 relay 实例 → 计数不复用（原先是模块级单例）
+    const otherPort = await freePort();
+    const otherRelay = createRelay({
+      getDshEndpoint: () => ({ host: '127.0.0.1', port: upstream.port }),
+      getConfig: () => normalizeConfig({
+        listenPort: otherPort, password: 'xff-pass', forceLoopback: false,
+      }),
+      log: () => {},
+    });
+    await otherRelay.start();
+    const fresh = await request(otherPort, '/__login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'password=wrong',
+    });
+    check('新实例的限流计数从零开始（表是实例级的）', fresh.status === 401, `got ${fresh.status}`);
+
+    await xffRelay.stop();
+    await otherRelay.stop();
+  }
+
+  section('上游白名单：非回环目标默认拒绝启动');
+  {
+    const offPort = await freePort();
+    // targetHost 指向非回环，且未显式打开开关
+    const denied = createRelay({
+      getDshEndpoint: () => ({ host: '127.0.0.1', port: upstream.port }),
+      getConfig: () => normalizeConfig({
+        listenPort: offPort, password: 'p', forceLoopback: false,
+        targetHost: '169.254.169.254', targetPort: 80,
+      }),
+      log: () => {},
+    });
+    const st = await denied.start();
+    check('非回环 targetHost → state=error', st.state === 'error', `got ${st.state}`);
+    check("lastError='off-host-target'", st.lastError === 'off-host-target', `got ${st.lastError}`);
+    check('拒绝时不占用端口', await portListening(offPort) === false, `port ${offPort} unexpectedly listening`);
+    check('status 标记 targetIsOffHost', denied.status().targetIsOffHost === true,
+      `got ${denied.status().targetIsOffHost}`);
+
+    // 显式打开开关后允许启动（「代理另一个 dsh 实例」的合法场景不被堵死）
+    const allowed = createRelay({
+      getDshEndpoint: () => ({ host: '127.0.0.1', port: upstream.port }),
+      getConfig: () => normalizeConfig({
+        listenPort: offPort, password: 'p', forceLoopback: false,
+        targetHost: '169.254.169.254', targetPort: 80,
+        allowOffHostTarget: true,
+      }),
+      log: () => {},
+    });
+    const st2 = await allowed.start();
+    check('allowOffHostTarget=true → 正常启动', st2.state === 'running', `got ${st2.state} / ${st2.lastError}`);
+    check('启动后仍标记 targetIsOffHost（便于排查）', allowed.status().targetIsOffHost === true,
+      `got ${allowed.status().targetIsOffHost}`);
+    await allowed.stop();
+
+    // 回环目标不需要开关
+    const loopOk = createRelay({
+      getDshEndpoint: () => ({ host: '127.0.0.1', port: upstream.port }),
+      getConfig: () => normalizeConfig({
+        listenPort: offPort, password: 'p', forceLoopback: false,
+        targetHost: '127.0.0.1', targetPort: upstream.port,
+      }),
+      log: () => {},
+    });
+    const st3 = await loopOk.start();
+    check('回环 targetHost 无需开关即可启动', st3.state === 'running', `got ${st3.state} / ${st3.lastError}`);
+    check('回环目标 targetIsOffHost=false', loopOk.status().targetIsOffHost === false,
+      `got ${loopOk.status().targetIsOffHost}`);
+    await loopOk.stop();
+
+    // 配置往返：开关必须能被 toStorable 存下并原样读回
+    const rt = normalizeConfig(toStorable(normalizeConfig({
+      targetHost: '10.0.0.9', targetPort: 1234, allowOffHostTarget: true,
+    })));
+    check('allowOffHostTarget 配置往返一致', rt.allowOffHostTarget === true, `got ${rt.allowOffHostTarget}`);
+    const rtDefault = normalizeConfig(toStorable(normalizeConfig({ targetHost: '10.0.0.9' })));
+    check('未设置时往返为 false', rtDefault.allowOffHostTarget === false, `got ${rtDefault.allowOffHostTarget}`);
+    check('回环判定：127.0.0.1/localhost/::1 均为回环',
+      isLoopbackTargetHost('127.0.0.1') && isLoopbackTargetHost('localhost')
+      && isLoopbackTargetHost('::1') && isLoopbackTargetHost('[::1]'), 'loopback set mismatch');
+    check('回环判定：非回环为 false',
+      isLoopbackTargetHost('169.254.169.254') === false, 'off-host misjudged');
+  }
+
+  section('zlib maxOutputLength：超限时抛错而非静默撑爆');
+  {
+    // 压缩炸弹：极小的压缩体解出远超上限的内容。
+    // 64 MiB 的 0x41 压成不到 100 KiB（约 700:1），足以冲破 MAX_DECODED_BYTES。
+    const bomb = zlib.gzipSync(Buffer.alloc(72 * 1024 * 1024, 0x41), { level: 9 });
+    check('炸弹压缩体本身很小', bomb.length < 200000, `got ${bomb.length}`);
+    let threw = null;
+    try {
+      decodeBody(bomb, 'gzip');
+    } catch (err) {
+      threw = err;
+    }
+    check('解压超过 MAX_DECODED_BYTES 会抛错', threw !== null, 'no error thrown');
+    check('抛的是 zlib 的越界错误', threw !== null && /maxOutputLength|buffer|memory/i.test(String(threw.message || threw)),
+      threw === null ? 'none' : String(threw.message || threw));
+
+    // 正常体积不受影响（上限给足了余量，不该误伤）
+    const normal = Buffer.from('const h = { isLoopback: x };'.repeat(1000));
+    const roundTrip = decodeBody(zlib.gzipSync(normal), 'gzip');
+    check('正常体积解压不受上限影响', roundTrip.length === normal.length, `got ${roundTrip.length}`);
+    check('gzip 往返编码正常', encodeBody(normal, 'gzip').length > 0, 'encode failed');
+  }
+
+  section('status() 纯读：不写回 lastError');
+  {
+    // status() 被 UI 每 3 秒轮询、被 relay_status 工具随时调用。
+    // 若它把一次偶发的读取失败写进 lastError，状态就会因为这个陈旧值
+    // 永远显示成 error —— 「看一眼」本身改变了行为。
+    const p1 = await freePort();
+    const r1 = createRelay({
+      getDshEndpoint: () => { throw new Error('boom'); },   // 端点读取抛错
+      getConfig: () => normalizeConfig({ listenPort: p1, password: '', forceLoopback: false }),
+      log: () => {},
+    });
+    const broken = r1.status();
+    check('端点读取失败时该次 status 仍给出说明',
+      typeof broken.lastError === 'string' && broken.lastError.includes('boom'),
+      JSON.stringify(broken.lastError));
+
+    // 关键：一个实例的陈旧 lastError 不得影响另一个实例的状态判定
+    const r2 = createRelay({
+      getDshEndpoint: () => ({ host: '127.0.0.1', port: upstream.port }),
+      getConfig: () => normalizeConfig({ listenPort: p1, password: '', forceLoopback: false }),
+      log: () => {},
+    });
+    const st = await r2.start();
+    check('正常实例 state=running', st.state === 'running', `got ${st.state} / ${st.lastError}`);
+    check('正常实例 lastError=null（未被别的实例污染）', st.lastError === null, String(st.lastError));
+
+    // stop 不是错误：不得把它写成 lastError
+    await r2.stop();
+    const stopped = r2.status();
+    check('stop 后 state=stopped', stopped.state === 'stopped', stopped.state);
+    check('stop 后 lastError 仍为 null', stopped.lastError === null, String(stopped.lastError));
+
+    // 反复读 status 不得改变任何持久状态
+    const first = JSON.stringify(r2.status());
+    r2.status(); r2.status(); r2.status();
+    check('反复读 status 输出不变（纯读）', JSON.stringify(r2.status()) === first,
+      'status changed across repeated calls');
   }
 
   section('上游不可达 → 502');

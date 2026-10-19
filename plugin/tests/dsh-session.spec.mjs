@@ -26,7 +26,7 @@ import {
   encodeCookie, decodeCookie, decodeBase64Url, encodeBase64Url, readCookieValue,
 } from '../dsh-public-relay/lib/dsh-cookie.js';
 import { createRelay } from '../dsh-public-relay/lib/relay.js';
-import { normalizeConfig } from '../dsh-public-relay/lib/config.js';
+import { normalizeConfig, toStorable } from '../dsh-public-relay/lib/config.js';
 
 /* ── 测试骨架 ── */
 const WATCHDOG_MS = 120000;
@@ -189,7 +189,104 @@ async function main() {
     // 密钥文件被删 → 保留旧密钥（不该突然失效）
     fs.rmSync(file);
     const stillOk = signer.checkout(AUTHORITY, undefined);
-    check('密钥文件消失后仍能用缓存密钥', stillOk.injected === true, stillOk.reason);
+    check('密钥文件消失后仍能用缓存密钥（瞬时故障不掉线）', stillOk.injected === true, stillOk.reason);
+  }
+
+  section('status() 脱敏：只给 basename');
+  {
+    const { file } = writeFakeCredentials(SECRET);
+    const signer = createSessionSigner({ credentialsFile: file });
+    const st = signer.status();
+    check('credentialsFile 只有文件名，无父目录', st.credentialsFile === path.basename(file),
+      `got ${st.credentialsFile}`);
+    check('不含分隔符（不是完整路径）',
+      !st.credentialsFile.includes('/') && !st.credentialsFile.includes('\\'), st.credentialsFile);
+    check('文件名是约定的 .credentials.yaml', st.credentialsFile === '.credentials.yaml',
+      st.credentialsFile);
+    // 密钥材料本身任何时候都不能出现在状态里
+    const encoded = encodeBase64Url(SECRET);
+    check('status 不含密钥字节', !JSON.stringify(st).includes(encoded), 'secret leaked');
+  }
+
+  section('旧密钥 staleness TTL：超过 10 分钟停止代签');
+  {
+    const { file } = writeFakeCredentials(SECRET);
+    const signer = createSessionSigner({ credentialsFile: file, log: () => {} });
+    check('刚读到时 ready=true', signer.status().ready === true, JSON.stringify(signer.status()));
+
+    // 文件还在 → 一直可用（正常路径不会走到 TTL）
+    fs.rmSync(file, { force: true });
+    const soon = signer.checkout(AUTHORITY, undefined);
+    check('文件消失后短期内仍代签（避免瞬时掉线）', soon.injected === true, soon.reason);
+    check('短期内 status().ready 仍为 true', signer.status().ready === true,
+      String(signer.status().ready));
+
+    // TTL 是 10 分钟。用 force 刷新 + 断言行为，而不是真的等 10 分钟：
+    // 把 Date.now 前推超过 TTL，再 force 一次读（必然失败）。
+    const realNow = Date.now;
+    try {
+      Date.now = () => realNow() + 11 * 60 * 1000;   // 超过 TTL
+      const after = signer.checkout(AUTHORITY, undefined);
+      check('超过 TTL 后停止注入', after.injected === false, after.reason);
+      check('原因标为 stale-secret', after.reason === 'stale-secret', after.reason);
+      check('不再返回 cookie 名字', after.name === null, String(after.name));
+      check('原 Cookie 头原样透传（不破坏上游请求）',
+        typeof after.cookieHeader === 'string' || after.cookieHeader === undefined, 'mangled');
+    } finally {
+      Date.now = realNow;
+    }
+
+    // TTL 之后 status().ready 必须翻 false，UI 才能告知用户。
+    // 注意 signer2 必须**先有一份可读的文件**（上面那段已把 file 删了），
+    // 而且要在时钟还是正常的时候读到一次 —— 否则 mock 一装上就是 stale，
+    // 测的就不是「过期」而是「从未读到」。
+    const { file: file2 } = writeFakeCredentials(SECRET);
+    const signer2 = createSessionSigner({ credentialsFile: file2, log: () => {} });
+    check('第二个 signer 先 ready', signer2.status().ready === true, 'not ready');
+    fs.rmSync(file2, { force: true });        // 此刻时钟正常：已读到过一次，记住 lastGoodReadAt
+    try {
+      Date.now = () => realNow() + 11 * 60 * 1000;
+      check('超过 TTL 后 status().ready=false', signer2.status().ready === false,
+        String(signer2.status().ready));
+      check('hasSecret 仍为 true（密钥还在内存，只是过期）',
+        signer2.status().hasSecret === true, String(signer2.status().hasSecret));
+      check('lastError 说明了原因', typeof signer2.status().lastError === 'string', 'no error');
+    } finally {
+      Date.now = realNow;
+    }
+
+    // 文件恢复后应立即自愈，不需要重启
+    const { file: restored } = writeFakeCredentials(SECRET);
+    const signer3 = createSessionSigner({ credentialsFile: restored, log: () => {} });
+    fs.rmSync(restored);
+    signer3.checkout(AUTHORITY, undefined);            // 先缓存一把
+    fs.writeFileSync(restored, `records:\n  client-connection/browser-session:\n    payload:\n      secret: ${encodeBase64Url(SECRET)}\n`);
+    const healed = signer3.checkout(AUTHORITY, undefined);
+    check('文件恢复后自动回到可用', healed.injected === true, healed.reason);
+    check('恢复后 status().ready=true', signer3.status().ready === true, String(signer3.status().ready));
+  }
+
+  section('口令长度上限：512 字符夹取');
+  {
+    const longPw = 'x'.repeat(1000);
+    const capped = normalizeConfig({ password: longPw });
+    check('超长口令被夹到 512', capped.password.length === 512, String(capped.password.length));
+    check('标记已被夹取（UI 要能告知用户）', capped.passwordTruncated === true, String(capped.passwordTruncated));
+    check('报告原始长度，便于说明「1000 → 512」', capped.passwordRawLength === 1000, String(capped.passwordRawLength));
+    check('保留的是前 512 个字符', capped.password === longPw.slice(0, 512), 'wrong slice');
+
+    // 未超限时不误报
+    const normal = normalizeConfig({ password: 'short' });
+    check('正常口令不被夹取', normal.password === 'short' && normal.passwordTruncated === false,
+      `${normal.password} / ${normal.passwordTruncated}`);
+
+    // 边界：正好 512 不算超限
+    const exact = normalizeConfig({ password: 'y'.repeat(512) });
+    check('正好 512 不算超限', exact.passwordTruncated === false, String(exact.passwordTruncated));
+
+    // 落盘的是夹取后的值（不是 1000 字符）
+    check('落盘值也是夹取后的', toStorable(capped).password.length === 512,
+      String(toStorable(capped).password.length));
   }
 
   section('配置归一化：autoSession 的安全约束');
