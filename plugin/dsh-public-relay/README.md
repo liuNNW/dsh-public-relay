@@ -77,7 +77,7 @@ dsh plugin --profile <profile> add dsh-public-relay
 ### 自检 / 清理
 
 ```powershell
-# 自检：manifest 兼容性 + 所有 lib/*.js 语法 + 五套测试（共 244 项断言）
+# 自检：manifest 兼容性 + 所有 lib/*.js 语法 + 五套测试（共 248 项断言）
 powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Check
 
 # 尝试用官方 CLI 安装
@@ -233,8 +233,8 @@ Windows PowerShell 5.1 按系统 ANSI 代码页读无 BOM 脚本，而本脚本�
 ## 开发
 
 ```powershell
-# 五套测试（共 244 项断言）
-node plugin\tests\smoke.mjs              # 中转核心 72 项
+# 五套测试（共 248 项断言）
+node plugin\tests\smoke.mjs              # 中转核心 76 项
 node plugin\tests\host-integration.mjs   # 宿主半   53 项
 node plugin\tests\client-half.mjs        # 浏览器半 62 项
 node plugin\tests\dsh-session.spec.mjs   # 会话代签 52 项
@@ -251,12 +251,19 @@ node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" cat <内部路径>
 
 ### 性能探针（公网访问调优用）
 
-三个脚本都直连真实 dsh + 真实中转，输出可核对的数字：
+五个脚本都直连真实 dsh + 真实中转，输出可核对的数字：
 
 ```powershell
 # 启动流量放大倍率：直连 gzip vs 经中转，逐 bundle 对比
 #   修复前 2.55x（10.29 MB → 26.18 MB），修复后应为 1.00x
 node plugin\tools\analyze-relay-payload.mjs
+
+# 「打开一个会话」的线缆字节：直连 vs 经中转（WS 压缩的核心指标）
+#   修复前 6.58 MB → 修复后 1.39 MB（4.8x，省 79%）
+node plugin\tools\probe-ws-wire.mjs
+
+# 切换会话是否每次都重拉：open A → open B → open A
+node plugin\tools\probe-switch-cost.mjs
 
 # WebSocket 长连接稳定性 + 心跳间隔是否已放宽
 #   40s 窗口内默认应为 ~20 个 Ping；放宽到 15000ms 后应只有 2–3 个
@@ -266,6 +273,21 @@ node plugin\tools\probe-ws-stability.mjs 40000
 node plugin\tools\probe-session-size.mjs [会话 .jsonl.zstd 路径]
 ```
 
+### 会话历史的传输真相（决定了 WS 压缩这一项）
+
+从 dsh 0.2.1-rc.2 源码 + 实测确认：
+
+| 事实 | 依据 |
+| --- | --- |
+| 打开会话走 **WebSocket**（`session/follow`），返回**一个巨型文本帧** | 实测 6.58 MB / 1 帧 |
+| dsh 的 `compression` 中间件**只作用于 HTTP**，完全绕过 WS | webserver 的 `createGzipMiddleware` |
+| dsh 构造 `WebSocketServer({ noServer: true })`，**没开** `perMessageDeflate` | `ws` 默认即 `false` |
+| 向上翻更多走 unary RPC（fetch）→ 会被 gzip | `SessionEventStream.readPage` |
+| 服务端没有「发过就跳过」机制 | `open A → open B → open A` 三次都是全量 |
+
+所以历史是**明文过隧道**的。中转在「浏览器 ↔ 中转」这一段做帧级压缩
+（上游 dsh 侧不声明压缩、载荷不变），实测 **6.58 MB → 1.39 MB**。
+
 ### 公网访问调优的三处改动（0.2.1 起）
 
 | 问题 | 实测 | 改法 |
@@ -273,6 +295,7 @@ node plugin\tools\probe-session-size.mjs [会话 .jsonl.zstd 路径]
 | 中转对**所有** `/plugins/` 强制 `identity` 并缓冲 | 85 个 bundle 全被解压重传，10.29 MB → 26.18 MB（**2.55x**） | 只对白名单包 `@deepseek-ai/dsh-client-connection` 改写，其余透传 |
 | 改写后写死 `no-store`，丢掉强缓存 | 直连 `max-age=31536000, immutable` → 经中转 `no-store` | 保留上游缓存头（combo URL 自带 `rev=<hash>`，天然可缓存） |
 | 每请求 `agent: false`，上一跳不复用 | TIME_WAIT 随请求数线性堆积 | 统一 `http.Agent({ keepAlive: true })`（WS upgrade 仍不复用） |
+| **WS 历史是明文大帧**（dsh 未开 `perMessageDeflate`，`compression` 又只管 HTTP） | 打开一个会话 **6.58 MB / 1 帧**，全程明文过隧道 | 中转做**帧级代理**：浏览器侧开压缩、上游侧不声明；实测 **6.58 → 1.39 MB（4.8x）** |
 
 > 第四处（dsh 心跳窗口）不在本包里，改的是 profile 的 `cordis.patch.yml`：
 > `typert-gateway` 的 `websocketHeartbeatIntervalMs` 从默认 2000 调到 15000。

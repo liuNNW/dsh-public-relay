@@ -72,6 +72,18 @@ export const DEFAULTS = Object.freeze({
    * 安全前提：口令非空时才生效（见 normalizeConfig 的硬约束）。
    */
   autoSession: true,
+  /**
+   * WebSocket 压缩（`permessage-deflate`，只在「浏览器 ↔ 中转」这一段生效）。
+   *
+   * 打开的理由：dsh 的会话历史走 `/api/remote.mux` 的 WebSocket，且是
+   * **一个巨型文本帧**（实测打开一个 4 MB 会话 = 4.60 MB / 1 帧）；dsh 构造
+   * `WebSocketServer` 时没开压缩，`compression` 中间件又只管 HTTP，所以
+   * 这段历史**明文过隧道**。实测 gzip 后 0.79 MB（5.8x）。
+   *
+   * 上游 dsh 侧**不声明压缩**，载荷与改造前完全一致，dsh 无感。
+   * 依赖 `ws`（dsh 自带）；拿不到时自动回退裸 pipe，功能降级但不崩。
+   */
+  compressWebSocket: true,
 });
 
 /** 数值夹取（端口等）。 */
@@ -127,6 +139,7 @@ export function normalizeConfig(raw) {
     password,
     forceLoopback: src.forceLoopback !== false,
     autoSession,
+    compressWebSocket: src.compressWebSocket !== false,
     /**
      * 用户原意（未被「口令为空」这条约束压过）。
      *
@@ -166,5 +179,6 @@ export function toStorable(config) {
     forceLoopback: config.forceLoopback,
     // 存「用户原意」，生效与否每次由 normalizeConfig 判。
     autoSession: config.autoSessionWanted,
+    compressWebSocket: config.compressWebSocket !== false,
   };
 }

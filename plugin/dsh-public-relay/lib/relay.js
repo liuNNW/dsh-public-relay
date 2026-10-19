@@ -27,6 +27,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
+import os from 'node:os';
 
 // ─────────────────────────── 常量 ───────────────────────────
 
@@ -57,6 +58,25 @@ const SCRIPT_CONTENT_TYPES = ['application/javascript', 'text/javascript', 'appl
 const LOOPBACK_PATCH_PACKAGES = [
   '@deepseek-ai/dsh-client-connection',
 ];
+
+/**
+ * WebSocket 压缩参数。
+ *
+ * `threshold` 是关键：实测会话事件的单帧尺寸中位数只有约 286 B，对这么小的
+ * 帧现压现解反而更贵（deflate 头 + CPU）。1024 B 以下不压，既保住小帧的
+ * 低延迟，又拿到大帧（历史快照）的绝大部分收益。
+ *
+ * `level` 用 1：历史帧是 4 MB 量级的重复 JSON，低档位就能压到约 1/5，
+ * 而 CPU 开销远低于默认 6 档 —— 压缩本身不该成为新的瓶颈。
+ */
+const WS_DEFLATE_OPTIONS = {
+  threshold: 1024,
+  zlibDeflateOptions: { level: 1, memLevel: 8, chunkSize: 16 * 1024 },
+  zlibInflateOptions: { chunkSize: 16 * 1024 },
+  // 不做 context takeover：每条消息独立压缩，避免跨消息的字典状态占用内存
+  serverNoContextTakeover: true,
+  clientNoContextTakeover: true,
+};
 
 // ─────────────────────────── 头部工具 ───────────────────────────
 
@@ -503,6 +523,21 @@ export function createRelay(options = {}) {
   let authCache = { password: undefined, auth: null };
 
   /**
+   * WebSocket 流量统计。
+   *
+   * `downlinkPlain` 是**解压前的逻辑字节**（= 浏览器最终看到的数据量），
+   * 它与实际线缆字节的比值就是压缩率 —— 这是「切会话到底还卡不卡」的
+   * 唯一可核对指标，所以直接暴露到 status 里。
+   */
+  const wsBytesCounter = { uplink: 0, downlinkPlain: 0 };
+  const wsBytesTracker = {
+    connections: 0,
+    opened: 0,
+    open() { this.opened += 1; this.connections += 1; },
+    close() { this.connections = Math.max(0, this.connections - 1); },
+  };
+
+  /**
    * 打给上游的 keep-alive 连接池。
    *
    * 旧实现每处转发都写 `agent: false`（= 不复用、每个请求新建 TCP）。在
@@ -542,6 +577,8 @@ export function createRelay(options = {}) {
       password: c.password ?? '',
       forceLoopback: c.forceLoopback !== false,
       autoSession: c.autoSession !== false,
+      // 默认开：会话历史走 WS 且是明文，压缩实测能省约 5.8x。
+      compressWebSocket: c.compressWebSocket !== false,
     };
   }
 
@@ -864,14 +901,136 @@ export function createRelay(options = {}) {
   }
 
   // ── WebSocket upgrade 代理 ──
-  function handleUpgrade(req, socket, head, auth, c) {
-    socket.on('error', () => socket.destroy());
-    if (!authGate(req, null, socket, auth, c.password, log)) return;
 
-    const TARGET = target();
-    // WebSocket 也要补签：dsh 的 RPC 下行流与事件推送都走 upgrade。
-    // 这里**刻意**不复用 upstreamAgent：升级后的连接会一直持有 socket，
-    // 放进连接池只会占住名额。
+  /**
+   * 软获取 `ws`。
+   *
+   * 解析顺序（与测试里的 `loadWsOrNull` 保持一致）：
+   *   1. `import('ws')` —— profile 里若把 ws 提升到顶层就能命中
+   *   2. dsh 自带的那份（`$DSH_HOME/profiles/<profile>/node_modules/ws`）
+   *      实测 dsh 0.2.x 确实带 ws@8.21，所以这条是常态命中的那条
+   *
+   * 拿不到时返回 null → 回退裸 pipe（功能降级，不崩）。
+   *
+   * @returns {Promise<{WebSocket: any, WebSocketServer: any}|null>}
+   */
+  let wsModulePromise = null;
+  function loadWs() {
+    if (wsModulePromise === null) {
+      wsModulePromise = (async () => {
+        const userProfile = (os.homedir() || '').replace(/\\/g, '/');
+        const dshHome = (process.env.DSH_HOME || `${userProfile}/.dsh`).replace(/\\/g, '/');
+        const profile = process.env.DSH_PROFILE || 'desktop';
+        const candidates = [
+          'ws',
+          `file:///${dshHome}/profiles/${profile}/node_modules/ws/wrapper.mjs`,
+          `file:///${dshHome}/profiles/node_modules/ws/wrapper.mjs`,
+        ];
+        for (const spec of candidates) {
+          try {
+            const mod = await import(spec);
+            const WebSocket = mod.default ?? mod.WebSocket;
+            const WebSocketServer = mod.WebSocketServer;
+            if (typeof WebSocket === 'function' && typeof WebSocketServer === 'function') {
+              return { WebSocket, WebSocketServer };
+            }
+          } catch { /* 试下一个 */ }
+        }
+        log('warn', 'ws 不可用，WebSocket 将按裸 pipe 转发（无压缩）');
+        return null;
+      })();
+    }
+    return wsModulePromise;
+  }
+
+  /** 压缩是否可用（决定走帧代理还是裸 pipe）。 */
+  let wsCompressionReady = null;
+
+  /**
+   * 一条被帧代理接管的连接。
+   *
+   * 两端独立协商：浏览器侧开 `perMessageDeflate`，上游 dsh 侧**不开**
+   * （保持与改造前完全一致的载荷，dsh 无感）。
+   */
+  function proxyUpgradeWithFrames({ wsMod, req, socket, head, TARGET, c, rawHeaders }) {
+    const { WebSocketServer, WebSocket } = wsMod;
+
+    // 浏览器侧：接受升级并开启压缩（只服务这一条连接，收完即弃）
+    const wss = new WebSocketServer({ noServer: true, perMessageDeflate: WS_DEFLATE_OPTIONS });
+    wss.handleUpgrade(req, socket, head, (client) => {
+      wss.close();   // 只服务这一条连接，收完即弃
+
+      // 上游 dsh：**不声明压缩**，载荷与改造前一致。
+      // 注意：ws 的构造是异步的，'open' 之前 send 会抛错 —— 用一个队列接住。
+      const upstream = new WebSocket(`ws://${TARGET.hostname}:${TARGET.port}${req.url}`, { headers: rawHeaders });
+      let upstreamOpen = false;
+      const pendingToUpstream = [];
+
+      /** 任一端的关闭理由，透传给另一端。 */
+      let closing = false;
+
+      const teardown = (why) => {
+        if (closing) return;
+        closing = true;
+        pendingToUpstream.length = 0;
+        try { client.close(); } catch { /* 已关 */ }
+        try { upstream.close(); } catch { /* 已关 */ }
+        try { client.terminate(); } catch { /* 已关 */ }
+        try { upstream.terminate(); } catch { /* 已关 */ }
+        wsBytesTracker.close(why);
+      };
+
+      // ── 立即挂监听，不要等 'open' ──
+      // 这台机器上客户端往往在 upstream 连上之前就发了第一帧；若把监听放在
+      // 'open' 回调里注册，那一帧会被 ws 直接丢弃（不会缓存），表现为
+      // 「握手成功但没有任何回显」。
+      client.on('message', (data, isBinary) => {
+        wsBytesCounter.uplink += data.length;
+        if (!upstreamOpen) {
+          // 上游还没连上：先排队，连上后按序补发
+          pendingToUpstream.push({ data, isBinary });
+          return;
+        }
+        try { upstream.send(data, { binary: isBinary }); } catch { teardown('uplink-send-failed'); }
+      });
+
+      // dsh → 浏览器：这才是被压缩的大头（历史快照 4.6 MB 单帧）
+      upstream.on('message', (data, isBinary) => {
+        wsBytesCounter.downlinkPlain += data.length;
+        try { client.send(data, { binary: isBinary }); } catch { teardown('downlink-send-failed'); }
+      });
+
+      upstream.on('open', () => {
+        upstreamOpen = true;
+        wsCompressionReady = true;
+        // 补发排队帧（保持顺序）
+        for (const item of pendingToUpstream) {
+          try { upstream.send(item.data, { binary: item.isBinary }); } catch { teardown('uplink-flush-failed'); return; }
+        }
+        pendingToUpstream.length = 0;
+      });
+
+      // 存活语义：把两端的 ping/pong 互相透传，保持 dsh 的心跳判定不变
+      client.on('ping', (data) => { try { upstream.ping(data); } catch { /* 已关 */ } });
+      upstream.on('ping', (data) => { try { client.ping(data); } catch { /* 已关 */ } });
+      client.on('pong', () => { try { upstream.pong(); } catch { /* 已关 */ } });
+      upstream.on('pong', () => { try { client.pong(); } catch { /* 已关 */ } });
+
+      client.on('close', (code, reason) => { void code; void reason; teardown('client-close'); });
+      upstream.on('close', () => teardown('upstream-close'));
+      client.on('error', () => teardown('client-error'));
+      upstream.on('error', () => teardown('upstream-error'));
+
+      wsBytesTracker.open();
+    });
+  }
+
+  /**
+   * 裸 socket 转发（`ws` 不可用时 / 用户关掉压缩时的回退路径）。
+   *
+   * 与改造前完全一致：不解析帧，只做双向 pipe。
+   */
+  function proxyUpgradeRaw({ req, socket, head, TARGET, c }) {
     const headers = prepareForwardHeaders(req, true, TARGET, c);
     const proxyReq = http.request({
       hostname: TARGET.hostname,
@@ -879,7 +1038,7 @@ export function createRelay(options = {}) {
       method: 'GET',
       path: req.url,
       headers,
-      agent: false,
+      agent: false,   // 刻意不复用：升级连接会一直持有 socket
     });
     const timer = setTimeout(() => proxyReq.destroy(new Error('upstream connect timeout')), UPSTREAM_CONNECT_TIMEOUT_MS);
 
@@ -920,6 +1079,33 @@ export function createRelay(options = {}) {
     });
 
     proxyReq.end();
+  }
+
+  function handleUpgrade(req, socket, head, auth, c) {
+    socket.on('error', () => socket.destroy());
+    if (!authGate(req, null, socket, auth, c.password, log)) return;
+
+    const TARGET = target();
+
+    // 压缩关闭 → 直接走原来的裸 pipe（与改造前行为完全一致）
+    if (c.compressWebSocket === false) {
+      proxyUpgradeRaw({ req, socket, head, TARGET, c });
+      return;
+    }
+
+    void loadWs().then((wsMod) => {
+      if (wsMod === null) {
+        // 拿不到 ws：回退裸 pipe，功能降级但不断链
+        wsCompressionReady = false;
+        proxyUpgradeRaw({ req, socket, head, TARGET, c });
+        return;
+      }
+      // 上游握手头：与 HTTP 转发同一套（Host/Origin 改写 + 会话代签）
+      const headers = prepareForwardHeaders(req, true, TARGET, c);
+      proxyUpgradeWithFrames({ wsMod, req, socket, head, TARGET, c, rawHeaders: headers });
+    }).catch(() => {
+      proxyUpgradeRaw({ req, socket, head, TARGET, c });
+    });
   }
 
   // ── 启停 ──
@@ -1104,6 +1290,14 @@ export function createRelay(options = {}) {
       patchedScripts: patchCount,
       patchMisses,
       passthroughScripts: passthroughCount,
+      websocket: {
+        compressEnabled: c.compressWebSocket,
+        compressionReady: wsCompressionReady,
+        openConnections: wsBytesTracker.connections,
+        totalConnections: wsBytesTracker.opened,
+        uplinkBytes: wsBytesCounter.uplink,
+        downlinkBytes: wsBytesCounter.downlinkPlain,
+      },
       startedAt: running ? startedAt : null,
       uptimeMs: running ? Date.now() - startedAt : 0,
       lastError,

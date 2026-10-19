@@ -49,6 +49,36 @@ function section(title) {
   console.log(`\n── ${title} ──`);
 }
 
+/**
+ * 加载 `ws`（dsh 自带，不在本仓库的依赖里）。
+ *
+ * 解析顺序与插件的 `loadWs()` 一致：先 `import('ws')`（profile 里若有提升的
+ * 副本就能命中），再回退到 dsh 自带的那份。都拿不到就返回 null ——
+ * 此时中转会回退裸 pipe，测试跳过帧代理断言而不是判失败。
+ */
+let wsModuleCache;
+async function loadWsOrNull() {
+  if (wsModuleCache !== undefined) return wsModuleCache;
+  const candidates = [
+    'ws',
+    `file:///${(process.env.USERPROFILE || '').replace(/\\/g, '/')}/.dsh/profiles/desktop/node_modules/ws/wrapper.mjs`,
+    `file:///${(process.env.USERPROFILE || '').replace(/\\/g, '/')}/.dsh/profiles/node_modules/ws/wrapper.mjs`,
+  ];
+  for (const spec of candidates) {
+    try {
+      const mod = await import(spec);
+      const WebSocket = mod.default ?? mod.WebSocket;
+      const WebSocketServer = mod.WebSocketServer;
+      if (typeof WebSocket === 'function' && typeof WebSocketServer === 'function') {
+        wsModuleCache = { default: WebSocket, WebSocket, WebSocketServer };
+        return wsModuleCache;
+      }
+    } catch { /* 试下一个 */ }
+  }
+  wsModuleCache = null;
+  return null;
+}
+
 /** 取一个空闲端口。 */
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -185,19 +215,34 @@ function startUpstream() {
     res.end('nope');
   });
 
-  // WebSocket-ish echo：接受 upgrade 后原样回打
-  const upgradedSockets = new Set();
-  server.on('upgrade', (req, socket, head) => {
-    upgradedSockets.add(socket);
-    socket.on('close', () => upgradedSockets.delete(socket));
-    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
-    if (head && head.length) socket.write(head);
-    socket.on('data', (c) => socket.write(c));
-    socket.on('error', () => socket.destroy());
-  });
+  /**
+   * 上游的 WebSocket 端点：用真正的 ws 服务端回显。
+   *
+   * 为什么不能再像以前那样裸 socket 回打字节：中转现在做**帧级代理**，
+   * 它会解析 WebSocket 帧并重新编码。裸字节对它来说不是合法帧。
+   *
+   * 同样**不开** perMessageDeflate —— 真实 dsh 就是这样（默认 false），
+   * 正好用来验证「只压浏览器↔中转这一段」。
+   */
+  const upgradeSockets = new Set();
+  let upstreamWss = null;
+  const readyWss = loadWsOrNull().then((wsMod) => {
+    if (wsMod === null) return;
+    upstreamWss = new wsMod.WebSocketServer({ noServer: true });
+    upstreamWss.on('connection', (ws) => {
+      ws.on('message', (data) => ws.send(data));
+    });
+    server.on('upgrade', (req, socket, head) => {
+      upgradeSockets.add(socket);
+      socket.on('close', () => upgradeSockets.delete(socket));
+      upstreamWss.handleUpgrade(req, socket, head, (ws) => {
+        upstreamWss.emit('connection', ws, req);
+      });
+    });
+  }).catch(() => { /* ws 不可用：保持无 upgrade 支持，相关断言会跳过 */ });
 
   return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => resolve({
+    server.listen(0, '127.0.0.1', () => void readyWss.then(() => resolve({
       server,
       seen,
       issuedCookies,
@@ -215,11 +260,12 @@ function startUpstream() {
         let done = false;
         const fin = () => { if (!done) { done = true; r(); } };
         const timer = setTimeout(fin, 2000);
-        for (const s of [...upgradedSockets]) { try { s.destroy(); } catch { /* 已关 */ } }
+        for (const s of [...upgradeSockets]) { try { s.destroy(); } catch { /* 已关 */ } }
+        try { upstreamWss?.close(); } catch { /* 已关 */ }
         try { server.closeAllConnections?.(); } catch { /* 老版本 Node */ }
         server.close(() => { clearTimeout(timer); fin(); });
       }),
-    }));
+    })));
   });
 }
 
@@ -486,42 +532,58 @@ async function main() {
       config = { ...config, forceLoopback: true };
     }
 
-    section('WebSocket upgrade 透传');
+    section('WebSocket 帧代理（含 permessage-deflate）');
     {
-      const result = await new Promise((resolve) => {
-        const req = http.request({
-          host: '127.0.0.1',
-          port: relayPort,
-          path: '/ws',
-          headers: {
-            connection: 'Upgrade',
-            upgrade: 'websocket',
-            'sec-websocket-key': crypto.randomBytes(16).toString('base64'),
-            'sec-websocket-version': '13',
-            cookie,
-          },
-        });
-        const timer = setTimeout(() => resolve({ ok: false, reason: 'timeout' }), 5000);
-        req.on('upgrade', (_res, socket) => {
-          socket.write('hello-relay');
-          socket.once('data', (buf) => {
-            clearTimeout(timer);
-            socket.destroy();
-            resolve({ ok: true, echo: buf.toString() });
+      // 中转现在对 WS 做**帧级代理**（而不是裸 pipe）：浏览器侧开压缩、
+      // 上游侧不开。这样「切会话要拉的 4.6 MB 历史」在隧道上只剩约 1/6。
+      // 测试用真实 ws 客户端，因为裸 socket 写裸字节已经不是合法帧了。
+      const wsMod = await loadWsOrNull();
+      if (wsMod === null) {
+        console.log('  · 跳过：本机解析不到 ws（该路径会回退裸 pipe，属预期降级）');
+      } else {
+        const { default: WS } = wsMod;
+
+        /** 开一条 WS，发一条文本，收一条回显。 */
+        const roundtrip = (compress, payload) => new Promise((resolve) => {
+          const ws = new WS(`ws://127.0.0.1:${relayPort}/ws`, {
+            headers: { cookie },
+            ...(compress ? { perMessageDeflate: true } : {}),
           });
+          const timer = setTimeout(() => { try { ws.terminate(); } catch { /* 已关 */ } resolve({ ok: false, reason: 'timeout' }); }, 5000);
+          ws.on('open', () => {
+            ws.send(payload);
+          });
+          ws.on('message', (data) => {
+            clearTimeout(timer);
+            const echo = String(data);
+            try { ws.terminate(); } catch { /* 已关 */ }
+            resolve({ ok: true, echo, extensions: ws.extensions || '(none)' });
+          });
+          ws.on('error', (err) => { clearTimeout(timer); resolve({ ok: false, reason: err.message }); });
         });
-        req.on('response', (res) => {
-          clearTimeout(timer);
-          resolve({ ok: false, reason: `status ${res.statusCode}` });
-        });
-        req.on('error', (err) => {
-          clearTimeout(timer);
-          resolve({ ok: false, reason: err.message });
-        });
-        req.end();
-      });
-      check('upgrade 成功', result.ok, result.reason || 'no upgrade event');
-      check('双向数据透传一致', result.echo === 'hello-relay', `echo=${JSON.stringify(result.echo)}`);
+
+        const plain = await roundtrip(false, 'hello-relay');
+        check('WS 握手成功', plain.ok, plain.reason || 'no echo');
+        check('双向数据透传一致', plain.echo === 'hello-relay', `echo=${JSON.stringify(plain.echo)}`);
+
+        // 浏览器声明压缩 → 中转侧应协商成功
+        const compressed = await roundtrip(true, 'x'.repeat(200000));
+        check('浏览器侧协商了 permessage-deflate',
+          compressed.ok && String(compressed.extensions).includes('permessage-deflate'),
+          `extensions=${compressed && compressed.extensions}`);
+        check('大帧压缩后仍能正确透传（内容完整）',
+          compressed.ok && compressed.echo.length === 200000,
+          `len=${compressed.echo ? compressed.echo.length : 'n/a'}`);
+
+        // 关掉压缩开关后应退回不协商
+        config = { ...config, compressWebSocket: false };
+        const off = await roundtrip(true, 'hello-relay');
+        check('compressWebSocket=false 时不协商压缩',
+          off.ok && !String(off.extensions).includes('permessage-deflate'),
+          `extensions=${off && off.extensions}`);
+        check('关闭压缩后载荷仍正确', off.echo === 'hello-relay', `echo=${JSON.stringify(off.echo)}`);
+        config = { ...config, compressWebSocket: true };
+      }
     }
 
     section('未认证的 upgrade 被拒');

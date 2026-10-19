@@ -96,6 +96,11 @@ window.__ModuleLoader__.load({
       autoSessionNoKey: '读不到 dsh 的会话密钥：自动进入当前不可用（仍需 ?token=）。确认 $DSH_HOME/.credentials.yaml 含 client-connection/browser-session 记录。',
       autoSessionBlockedWarn: '自动管理 dsh 会话未生效：口令为空时代签不会启用 —— 代签等价于「中转持有 dsh 会话密钥」，口令是唯一门槛。请先填一个访问口令。',
       passwordEmptyWarn: '当前口令为空：任何能连到中转端口的人都能直接访问你的 dsh（公网暴露时务必填口令）。',
+      compressWebSocket: '压缩 WebSocket（会话历史）',
+      compressWebSocketHint: 'dsh 的会话历史走 WebSocket，且是一个明文大帧（实测打开一个会话约 4.6 MB）。开启后这段在「浏览器↔中转」之间压缩（约 5.8x），切换会话明显更快；上游 dsh 载荷不受影响。依赖 dsh 自带的 ws，取不到时自动回退为不压缩。',
+      compressUnavailableWarn: 'ws 不可用：WebSocket 按原样透传，会话历史不会压缩（功能正常，只是切换较慢）。',
+      wsCompress: 'WS 压缩',
+      wsDownlink: '历史下行',
       save: '保存',
       saving: '保存中…',
       discard: '放弃修改',
@@ -152,6 +157,11 @@ window.__ModuleLoader__.load({
       autoSessionNoKey: 'The dsh session secret could not be read: automatic entry is unavailable (?token= is still required). Check that $DSH_HOME/.credentials.yaml holds a client-connection/browser-session record.',
       autoSessionBlockedWarn: 'Automatic session signing is inactive: it never runs with an empty passcode — signing is equivalent to holding the dsh session secret, and the passcode is the only gate. Set a passcode first.',
       passwordEmptyWarn: 'The passcode is empty: anyone who can reach the relay port gets full access to your dsh.',
+      compressWebSocket: 'Compress WebSocket (session history)',
+      compressWebSocketHint: 'dsh serves session history over WebSocket as one large plaintext frame (measured: ~4.6 MB to open a session). This compresses it between browser and relay (~5.8x) so switching sessions is far faster; the upstream dsh payload is unchanged. Uses the ws package shipped with dsh and falls back to no compression when unavailable.',
+      compressUnavailableWarn: 'ws is unavailable: WebSocket traffic passes through unchanged, so session history is not compressed (everything still works, switching is just slower).',
+      wsCompress: 'WS compress',
+      wsDownlink: 'History down',
       save: 'Save',
       saving: 'Saving…',
       discard: 'Discard',
@@ -318,6 +328,28 @@ window.__ModuleLoader__.load({
       return String(lastError);
     }
 
+    /** 把字节数格式化成人能读的量级。 */
+    function humanBytes(n) {
+      if (!n || n <= 0) return '—';
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+      return `${(n / 1024 / 1024).toFixed(2)} MB`;
+    }
+
+    /**
+     * WS 压缩状态的三态显示。
+     *
+     * `compressionReady === null` 表示还没有 WS 连接过（无法判断），
+     * 不能显示成「关」—— 那会让用户以为开关坏了。
+     */
+    function wsCompressLabel(t, snap) {
+      const ws = snap.websocket;
+      if (!ws) return '—';
+      if (ws.compressEnabled === false) return t('off');
+      if (ws.compressionReady === null) return '—';
+      return ws.compressionReady === true ? t('on') : t('blocked');
+    }
+
     /* ═══════════════════ 面板 ═══════════════════ */
 
     /**
@@ -348,6 +380,7 @@ window.__ModuleLoader__.load({
         password: String(config.password ?? ''),
         forceLoopback: config.forceLoopback !== false,
         autoSession: wantedAutoSession(config),
+        compressWebSocket: config.compressWebSocket !== false,
       });
 
       useEffect(() => {
@@ -384,6 +417,7 @@ window.__ModuleLoader__.load({
         || draft.password !== String(cfg.password ?? '')
         || draft.forceLoopback !== (cfg.forceLoopback !== false)
         || draft.autoSession !== cfgAutoSession
+        || draft.compressWebSocket !== (cfg.compressWebSocket !== false)
       );
 
       const portText = draft ? draft.listenPort.trim() : '';
@@ -418,6 +452,7 @@ window.__ModuleLoader__.load({
             password: draft.password,
             forceLoopback: draft.forceLoopback,
             autoSession: draft.autoSession,
+            compressWebSocket: draft.compressWebSocket,
           });
           if (!mounted.current) return;
           if (res && res.ok === true) {
@@ -523,11 +558,22 @@ window.__ModuleLoader__.load({
             h('span', { className: 'dsr-metricV' }, sess === null ? '—' : (sessBlocked ? t('blocked') : sessOn ? t('on') : t('off')))),
           h('div', { className: 'dsr-metric' },
             h('span', { className: 'dsr-metricK' }, t('patched')),
-            h('span', { className: 'dsr-metricV' }, String(snap.patchedScripts ?? 0)))));
+            h('span', { className: 'dsr-metricV' }, String(snap.patchedScripts ?? 0))),
+          h('div', { className: 'dsr-metric' },
+            h('span', { className: 'dsr-metricK' }, t('wsCompress')),
+            h('span', { className: 'dsr-metricV' }, wsCompressLabel(t, snap))),
+          h('div', { className: 'dsr-metric' },
+            h('span', { className: 'dsr-metricK' }, t('wsDownlink')),
+            h('span', { className: 'dsr-metricV' }, humanBytes(snap.websocket?.downlinkBytes ?? 0)))));
 
         const err = errorText(t, snap.lastError);
         if (err) body.push(h('div', { key: 'err', className: 'dsr-warn' }, `⚠ ${err}`));
         if (!snap.hasPassword) body.push(h('div', { key: 'warn', className: 'dsr-warn' }, `⚠ ${t('passwordEmptyWarn')}`));
+        // 开了压缩但 ws 加载失败：这是静默降级，必须让用户知道
+        if (snap.websocket && snap.websocket.compressEnabled === true
+          && snap.websocket.compressionReady === false) {
+          body.push(h('div', { key: 'wsNoCompress', className: 'dsr-warn' }, `⚠ ${t('compressUnavailableWarn')}`));
+        }
         if (sessBlocked) body.push(h('div', { key: 'sessBlocked', className: 'dsr-warn' }, `⚠ ${t('autoSessionBlockedWarn')}`));
         if (sessOn && !sessBlocked && sess.ready !== true) {
           body.push(h('div', { key: 'sessNoKey', className: 'dsr-warn' }, `⚠ ${t('autoSessionNoKey')}`));
@@ -585,6 +631,8 @@ window.__ModuleLoader__.load({
         body.push(textField('password', t('password'), t('passwordHint'), ''));
         body.push(checkField('forceLoopback', t('forceLoopback'), t('forceLoopbackHint')));
         body.push(checkField('autoSession', t('autoSession'), t('autoSessionHint')));
+        // WS 压缩：会话历史是明文大帧，这是「切会话卡」的直接解药
+        body.push(checkField('compressWebSocket', t('compressWebSocket'), t('compressWebSocketHint')));
         if (draft.password === '') {
           body.push(h('p', { key: 'autoSessionBlocked', className: 'dsr-note dsr-err' }, t('autoSessionBlockedWarn')));
         }

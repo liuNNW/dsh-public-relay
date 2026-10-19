@@ -44,7 +44,7 @@ gh pr create --repo awesome-dsh-plugin/awesome-dsh-plugin \
 | --- | --- |
 | `package.json` 声明 `dsh.bundle`（可被 `dsh plugin add` 安装） | ✅ `{"bundle":{"patch":"./cordis.patch.yml"}}` |
 | 同级有 `cordis.patch.yml` | ✅ |
-| 真实可用代码，非占位 | ✅ 五套测试 244 项 + 在真实 dsh 0.2.1-rc.2 上端到端验证 |
+| 真实可用代码，非占位 | ✅ 五套测试 248 项 + 在真实 dsh 0.2.1-rc.2 上端到端验证 |
 | 仓库创建满 1 天 | ⏳ 2026-10-17T13:41Z 之后满足 |
 | 加 `dsh-plugin` topic | ⏳ 见下 |
 | 描述属实、无营销词 | ✅ 只写实测存在的机制 |
