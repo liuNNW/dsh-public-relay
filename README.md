@@ -266,6 +266,16 @@ node plugin\tools\audit-patcher-edges.mjs   # isLoopback 改写是否会产生�
 
 修改认证、限流或改写逻辑后，值得跑一遍。
 
+### 隧道连通性排查
+
+```powershell
+# 隧道证书是否被浏览器信任（自签证书会让 /api 全面 401）
+node plugin\tools\check-tunnel-tls.mjs https://<你的隧道域名>:<端口>
+```
+
+改隧道配置、换域名或遇到「页面能开但操作全 401」时，先跑这一条 ——
+它能一眼区分「证书问题」与「中转认证问题」，避免在服务器端空转排查。
+
 ### 插件安装 / 清理
 
 ```powershell
@@ -326,6 +336,39 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
    输入中转口令。0.3.1 起中转会自己拦下过期 token 并给登录页，不再有这条死路。
    状态面板的 `tokenExchange.rejects` 能确认是否发生了这种情况。
 2. **`autoSession` 没生效**（口令为空、或读不到密钥）。看状态区「自动会话」那一行的原因。
+
+**隧道证书是自签的 → 浏览器拦截 → 症状也是「页面能开、操作全挂」**
+
+这是最容易误判的一类：症状和上面几乎一样，但**服务器端一切正常**。
+
+```powershell
+# 一条命令判定
+node plugin\tools\check-tunnel-tls.mjs https://<你的隧道域名>:<端口>
+```
+
+若输出 `链验证 : 失败 ❌ (DEPTH_ZERO_SELF_SIGNED_CERT)`，说明隧道用的是自签证书：
+
+- 浏览器显示「您的连接不是私密连接」/ `ERR_CERT_AUTHORITY_INVALID`
+- 强行点「继续前往」后站点处于**不安全上下文**，Cookie 无法正常参与 `/api` 请求 → 全面 401
+- 樱花映射启用 `auto_https = auto` 但**未绑定自有域名**时只能签自签证书（它自己的日志也会警告）
+
+**⚠ 关键陷阱**：`curl -k` 忽略证书，所以「用 curl 测一切正常」**不能**排除此问题 ——
+恰恰是 `-k` 把唯一线索藏起来了。实测对照：
+
+```
+curl -k  https://.../api/...   → 200   （忽略证书）
+curl     https://.../api/...   → 000   （浏览器视角，TLS 握手失败）
+```
+
+**修复**（二选一）：
+
+- **免费方案（无需自有域名）**：樱花映射为所有用户提供免费 `*.nyat.app` 子域 +
+  受信任证书。在 <https://www.natfrp.com/tunnel/domain> 申请子域 → 绑定该隧道 →
+  确认隧道「自动 HTTPS」为「自动」→ **重启隧道**。启动日志出现
+  `已从服务器为 xxx.nyat.app 加载证书` 即成功（首次签发可能要几分钟）。
+  子域绑定开启 HSTS Preloading，因此**必须**走 HTTPS。
+- **自有域名方案**：用 Let's Encrypt 等公共 CA 证书替换
+  `FrpcWorkingDirectory\<域名>.{crt,key}`，见 <https://doc.natfrp.com/frpc/ssl.html>。
 
 **`install.ps1` 报语法错误（`The token '||' is not a valid statement separator` 等）**
 Windows PowerShell 5.1 按系统 ANSI 代码页读无 BOM 脚本，而本脚本是 UTF-8。
