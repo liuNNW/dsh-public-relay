@@ -312,6 +312,35 @@ node plugin\tools\probe-authority.mjs [dsh端口]
 第 3 条确认前端能否启动。**先跑工具，再下结论** —— 2026-10 那次排查因为直接
 用 `curl -k` 测，把它能发现的证书问题整个掩盖了，绕了很久。
 
+### 桌面端请求排查（405 / 路由缺失）
+
+**桌面端**（`dsh-app://app`）的请求用 curl 和普通浏览器都抓不到 ——
+它是 Electron 自定义 scheme，只存在于 dsh 进程内。
+但 dsh 自带 experimental-inspector，在 `127.0.0.1:9230` 暴露 CDP，
+其 target 能在 **Host realm**（Node 侧）执行代码，于是可以**在 dsh 自己的
+进程里挂钩 `http.Server`，看到它收到的每一个请求**：
+
+```powershell
+# 1) 注入钩子（常驻，直到 dsh 退出）
+node plugin\tools\hook-dsh-405.mjs 60
+
+# 2) 在 dsh 界面里操作（点开文件、展开侧边栏…），然后读取记录
+node plugin\tools\read-405-hits.mjs
+
+# 3) 静态对照：哪些路由+方法组合会返回 405
+node plugin\tools\probe-405.mjs
+
+# 4) 查 dsh 运行中的插件状态
+node plugin\tools\inspect-dsh-plugins.mjs sidebar
+```
+
+这在 2026-10-20 的排查里是决定性的：静态分析能看出 dsh 里有 6 处会返 405，
+但**无法确定实际命中哪一处**；钩子一挂上，真相立刻清楚 ——
+侧边栏插件 `dsh-better-sidebar` 0.25.0 依赖一个 dsh 里不存在的服务
+（`ctx.webRuntime`，实际叫 `ctx.web`），宿主半加载失败，
+它的 `/sidebar/*` 路由全部没注册，客户端的 POST 掉进 fallback → 405。
+升级到 0.28.0 即修复。
+
 ### 插件安装 / 清理
 
 ```powershell
