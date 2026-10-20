@@ -269,12 +269,23 @@ node plugin\tools\audit-patcher-edges.mjs   # isLoopback 改写是否会产生�
 ### 隧道连通性排查
 
 ```powershell
-# 隧道证书是否被浏览器信任（自签证书会让 /api 全面 401）
+# 1) 隧道证书是否被浏览器信任（自签证书会让 /api 全面 401）
 node plugin\tools\check-tunnel-tls.mjs https://<你的隧道域名>:<端口>
+
+# 2) 完整模拟浏览器经隧道访问：登录 → 首页 → /api，逐环节报告
+node plugin\tools\simulate-browser.mjs https://<你的隧道域名>:<端口> <中转口令>
+
+# 3) 页面能开但操作失败时：确认首页引用的每个 bundle 是否都能拉到
+node plugin\tools\trace-relay-load.mjs
+
+# 4) 验证代签 Cookie 的 authority 与 dsh 的 Host 是否一致
+node plugin\tools\probe-authority.mjs [dsh端口]
 ```
 
-改隧道配置、换域名或遇到「页面能开但操作全 401」时，先跑这一条 ——
-它能一眼区分「证书问题」与「中转认证问题」，避免在服务器端空转排查。
+改隧道配置、换域名或遇到「页面能开但操作全 401」时，按 1 → 2 → 3 顺序跑：
+第 1 条区分「证书问题」与「认证问题」，第 2 条给出完整链路结论，
+第 3 条确认前端能否启动。**先跑工具，再下结论** —— 2026-10 那次排查因为直接
+用 `curl -k` 测，把它能发现的证书问题整个掩盖了，绕了很久。
 
 ### 插件安装 / 清理
 
@@ -327,8 +338,12 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 
 **不带口令就进了页面，但所有操作都 401、控制台报 `transport failure for /api: HTTP 401`**
 
-两种可能，按顺序排查：
+按顺序排查（**先试第 0 条，它最省事且命中率最高**）：
 
+0. **先按 `Ctrl+Shift+R` 强制刷新一次**。浏览器可能缓存了旧的 JS bundle 或旧的
+   `dsh-auth-*` Cookie，导致前端拿着过期凭据发请求。2026-10-20 那次真实故障
+   就是这样解决的：服务器端逐项验证全通（登录 302 → 首页 200/42 KB →
+   `/api` ok:true），客户端硬刷新后立即恢复。
 1. **地址栏里带着 `?token=...`**（最常见）。那条 URL 来自**上一次 dsh 启动**，
    token 早已作废。旧版中转会放行它（只校验形状），于是绕过了中转口令、
    直接把请求丢给 dsh → dsh 回 401。
@@ -336,6 +351,8 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
    输入中转口令。0.3.1 起中转会自己拦下过期 token 并给登录页，不再有这条死路。
    状态面板的 `tokenExchange.rejects` 能确认是否发生了这种情况。
 2. **`autoSession` 没生效**（口令为空、或读不到密钥）。看状态区「自动会话」那一行的原因。
+3. **跑了 `simulate-browser.mjs` 仍然全绿却还是不行**：那就是纯客户端缓存问题，
+   清该站点的 Cookie/站点数据后重来（见第 0 条）。
 
 **隧道证书是自签的 → 浏览器拦截 → 症状也是「页面能开、操作全挂」**
 
