@@ -9,6 +9,7 @@
 | **DSH 插件**（推荐） | 日常使用。跑在 dsh 进程内，设置页里看端口、随时开关 | [`plugin/dsh-public-relay`](plugin/dsh-public-relay) |
 | **独立脚本** | 不想装插件、或要用它的 `dsh web` 守护 | [`dsh-public-relay.js`](dsh-public-relay.js) |
 
+- **当前版本**：`0.3.2`
 - **npm**：`dsh-public-relay`
 - **仓库**：<https://github.com/liuNNW/dsh-public-relay>
 - **许可证**：MIT
@@ -17,6 +18,13 @@
 ```sh
 dsh plugin --profile desktop add dsh-public-relay
 ```
+
+**目录**
+
+- [它解决什么问题](#它解决什么问题) · [快速开始](#快速开始) · [架构](#架构)
+- 设计：[超时语义](#超时语义连接与响应分开032) · [认证](#认证设计) · [管理路由鉴权](#管理路由的鉴权) · [会话代签](#会话代签的权限边界) · [`?token=` 验真](#token-放行必须验真031) · [`force-loopback`](#force-loopback-怎么改写)
+- 开发：[测试与自检](#开发) · [工具索引](#工具索引) · [安全审计](#安全审计工具)
+- 排查：[隧道连通性](#隧道连通性排查) · [桌面端 405](#桌面端请求排查405-路由缺失) · [排障清单](#排障)
 
 ---
 
@@ -265,14 +273,70 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Check
 
 # 兼容性自检（最容易踩、症状最隐蔽的坑）
 node plugin\tools\check-compat.mjs plugin\dsh-public-relay\package.json
+```
 
-# 读 dsh 的 app.asar（ls / cat / grep）
-node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" grep "<正则>" [路径前缀]
-node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" ls  [路径前缀]
-node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" cat <内部路径>
+### 工具索引
 
-# 探测「中转能否从插件上下文取到 dsh 的 launchToken」（token 验真的前提）
-node plugin\tools\probe-launch-token.mjs
+`plugin/tools/` 下 39 个脚本，按用途分五类。**遇到问题先查这张表，不要从零写探针。**
+
+#### ① 只读 dsh 内部（app.asar）
+
+```powershell
+node plugin\tools\asar.mjs "<asar>" ls  [路径前缀]      # 列文件（输出 "<路径> (<字节数>)"）
+node plugin\tools\asar.mjs "<asar>" cat <内部路径>       # 读单个文件
+node plugin\tools\asar.mjs "<asar>" grep "<正则>" [前缀]  # 内容搜索
+node plugin\tools\grep-asar.mjs                          # 同上，输出更精简
+node plugin\tools\read-asar-file.mjs                     # 带行号读取
+```
+
+#### ② 认证 / 会话代签
+
+```powershell
+node plugin\tools\probe-authority.mjs [dsh端口]      # 代签 authority 与 Host 是否一致（不一致必 401）
+node plugin\tools\probe-launch-token.mjs             # 能否取到当次 launchToken（token 验真的前提）
+node plugin\tools\check-auth-chain.mjs               # 逐层核对认证链路
+node plugin\tools\soak-relay-auth.mjs [轮数] [并发]    # 高频采样，捕间歇性 401
+node plugin\tools\probe-prompt.mjs                   # /api 各端点经中转 vs 直连对比
+node plugin\tools\fix-credentials-version.mjs        # 修 credentials 里的版本字段
+```
+
+#### ③ 隧道 / 连通性
+
+```powershell
+node plugin\tools\check-tunnel-tls.mjs https://<域名>:<端口>     # 证书是否被浏览器信任
+node plugin\tools\simulate-browser.mjs https://<域名>:<端口> <口令>  # 模拟浏览器全链路
+node plugin\tools\trace-relay-load.mjs                            # 首页引用的 bundle 能否全拉到
+node plugin\tools\probe-long-request.mjs                          # 长响应能否完整送达
+```
+
+#### ④ 桌面端 / 405 / 插件路由
+
+```powershell
+node plugin\tools\hook-dsh-405.mjs [秒数]      # 在 dsh 进程内挂钩 http.Server，记录收到的请求
+node plugin\tools\read-405-hits.mjs            # 读上面记下的请求
+node plugin\tools\probe-405.mjs                # 各路由 × 各方法的状态码矩阵
+node plugin\tools\inspect-dsh-plugins.mjs      # 查运行中的插件状态
+node plugin\tools\verify-sidebar-fixed.mjs     # /sidebar/* 是否由插件接管（而非落进 fallback）
+node plugin\tools\diagnose.mjs                 # 综合诊断
+node plugin\tools\verify-bundles-load.mjs      # 校验 bundle 能否加载
+```
+
+#### ⑤ 安装 / 修补 / 数据维护
+
+```powershell
+node plugin\tools\add-bundle.mjs               # 往 profile 追加 bundle
+node plugin\tools\set-relay-row.mjs            # 写/改 relay 的 loader 行
+node plugin\tools\clean-relay-rows.mjs         # 清理重复的 relay 行
+node plugin\tools\fix-web-patch.mjs            # 修 web patch
+node plugin\tools\repair-patch-array.mjs       # 修复被写坏的 patch 数组
+node plugin\tools\analyze-relay-payload.mjs    # 分析中转载荷
+node plugin\tools\probe-session-open.mjs       # 会话打开耗时/行为
+node plugin\tools\probe-session-size.mjs       # 会话体积构成
+node plugin\tools\probe-switch-cost.mjs        # 切换会话的开销
+node plugin\tools\probe-ws-stability.mjs       # WebSocket 稳定性
+node plugin\tools\probe-ws-wire.mjs            # WebSocket 线缆字节
+node plugin\tools\e2e-session.mjs              # 会话端到端
+node plugin\tools\e2e-verify.mjs               # 端到端校验
 ```
 
 ### 安全审计工具
@@ -380,6 +444,19 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 
 判 `incompatible-version` 的症状极具误导性：dsh 正常启动、日志不报错、插件文件都在，
 但 **rows 为空、UI 上哪里都看不到这个插件**，重启多少次都没用。本插件属第 4 种。
+
+---
+
+## 更新记录
+
+| 版本 | 关键变化 |
+| --- | --- |
+| `0.3.2` | **修复**：15s「connect timeout」实为整个请求总时限，会掐断 `session/prompt` 等长耗时调用。拆成两段：连接 15s / 等响应头 5 分钟 / 响应体传输不限时 |
+| `0.3.1` | **修复**：带过期 `?token=` 的 URL 可绕过中转口令（只校验形状），随后被 dsh 401。改为与当次 launchToken 恒定时比较，过期一律拦成登录页 |
+| `0.3.0` | WebSocket 帧级代理 + `permessage-deflate` 压缩（会话历史压缩约 4.8x） |
+| `0.2.x` | 配置改由插件自己的 JSON 持有（与 dsh settings 解耦）；管理路由加鉴权；`isLoopback` 改写改为按结构定位 |
+
+> 升级后需**完全退出 dsh 再启动**（含系统托盘）才会加载新版本 —— Electron 关窗口不杀进程。
 
 ---
 
