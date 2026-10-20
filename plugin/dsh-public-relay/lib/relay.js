@@ -57,7 +57,30 @@ export { makeAuth, loginKeyOf, isLoopbackPeer, LOGIN_PAGE };
 /** hop-by-hop 头：逐跳语义不能透传；upgrade 场景单独保留 connection/upgrade。 */
 const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
 
+/**
+ * 上游**连接**阶段兜底超时（DNS + TCP + 等 socket 就绪）。
+ *
+ * 只覆盖「能不能连上」，**不覆盖**「上游什么时候回响应」——
+ * 后者见 UPSTREAM_RESPONSE_TIMEOUT_MS 的说明。
+ */
 const UPSTREAM_CONNECT_TIMEOUT_MS = 15000;
+
+/**
+ * 上游**响应头**等待上限（连接建立之后才开始计时）。
+ *
+ * 为什么需要它：上游可能「TCP 连得上但永不应答」（进程挂死、accept 后不处理），
+ * 若此时完全没有超时，请求会永久悬挂，客户端只能干等到自己超时。
+ *
+ * 为什么给到 5 分钟这么宽：
+ *   · 这个计时器**只等响应头**，不等响应体。HTTP 代理的响应头是上游处理完
+ *     请求后立刻发出的，不存在「合法但要等很久」的情形 —— 慢的是响应体
+ *     （AI 流式输出、大文件），而响应体一旦开始传输就不再计时。
+ *   · 但 `session/prompt` 这类调用在 dsh 侧可能先做较久的准备（读上下文、
+ *     建 session）才回响应头，所以不能设得太紧（旧版 15s 就是这么出事的）。
+ *   · 5 分钟足以覆盖「上游活着只是慢」，又能在真挂死时给客户端一个明确失败。
+ */
+const UPSTREAM_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
+
 const STOP_DRAIN_TIMEOUT_MS = 2000;
 
 /**
@@ -970,10 +993,25 @@ export function createRelay(options = {}) {
       headers,
       agent: ensureAgent(),
     });
+    // 两段式超时：connect 只管建连，response 只管等响应头（见 handleRequest 的详细说明）
     const timer = setTimeout(() => proxyReq.destroy(new Error('upstream connect timeout')), UPSTREAM_CONNECT_TIMEOUT_MS);
+    let responseTimer = null;
+    proxyReq.on('socket', () => {
+      clearTimeout(timer);
+      if (responseTimer === null && !proxyReq.destroyed) {
+        responseTimer = setTimeout(
+          () => proxyReq.destroy(new Error('upstream response timeout')),
+          UPSTREAM_RESPONSE_TIMEOUT_MS,
+        );
+      }
+    });
+    const clearTimers = () => {
+      clearTimeout(timer);
+      if (responseTimer !== null) clearTimeout(responseTimer);
+    };
 
     proxyReq.on('response', (proxyRes) => {
-      clearTimeout(timer);
+      clearTimers();
       const status = proxyRes.statusCode ?? 502;
       const upstreamHeaders = stripHopByHop(proxyRes.headers);
       const encoding = String(proxyRes.headers['content-encoding'] || '').toLowerCase();
@@ -1090,7 +1128,7 @@ export function createRelay(options = {}) {
     });
 
     proxyReq.on('error', (err) => {
-      clearTimeout(timer);
+      clearTimers();
       if (!res.headersSent) {
         res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
         res.end(`relay: 无法连接上游 ${TARGET.origin}（${err.code || err.message}）。\n`);
@@ -1145,10 +1183,25 @@ export function createRelay(options = {}) {
       () => proxyReq.destroy(new Error('upstream connect timeout')),
       UPSTREAM_CONNECT_TIMEOUT_MS,
     );
+    let responseTimer = null;
+    const clearTimers = () => {
+      clearTimeout(timer);
+      if (responseTimer !== null) clearTimeout(responseTimer);
+    };
+    // 连接阶段兜底；拿到 socket 后转为「等响应头」计时（两段式）
+    proxyReq.on('socket', () => {
+      clearTimeout(timer);
+      if (responseTimer === null && !proxyReq.destroyed) {
+        responseTimer = setTimeout(
+          () => proxyReq.destroy(new Error('upstream response timeout')),
+          UPSTREAM_RESPONSE_TIMEOUT_MS,
+        );
+      }
+    });
     let retried = false;
 
     proxyReq.on('response', (proxyRes) => {
-      clearTimeout(timer);
+      clearTimers();
       const status = proxyRes.statusCode || 502;
 
       // 上游拒绝这个 authority（信任栅栏）：改成回环权威重试一次。
@@ -1171,7 +1224,7 @@ export function createRelay(options = {}) {
     });
 
     proxyReq.on('error', (err) => {
-      clearTimeout(timer);
+      clearTimers();
       if (!res.headersSent) {
         res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
         res.end(`relay: 无法连接上游 ${TARGET.origin}（${err.code || err.message}）。\n`);
@@ -1226,17 +1279,58 @@ export function createRelay(options = {}) {
       headers,
       agent: ensureAgent(),
     });
-    const timer = setTimeout(() => proxyReq.destroy(new Error('upstream connect timeout')), UPSTREAM_CONNECT_TIMEOUT_MS);
+    /*
+     * ── 两段式超时（2026-10-20 修复）──
+     *
+     * 旧实现只有一个 15s 的定时器，且直到收到 `response` 才清除 ——
+     * 于是「连接超时」实际变成了**整个请求的总时限**。任何上游响应慢于
+     * 15s 的请求都被 destroy，回 502「upstream connect timeout」（而连接
+     * 明明是好的）。
+     *
+     * 受害最重的是 `session/prompt`：它是发起 AI 对话，正常就要几十秒到
+     * 几分钟。经中转时必然在 15s 被掐断，用户看到的就是「一操作就失败」。
+     *
+     * 但**不能**简单地把定时器一到 socket 就清掉：上游若是「TCP 连得上但
+     * 永不应答」（进程挂死 / accept 后不处理），请求就会永久悬挂。所以拆成两段：
+     *
+     *   ① connectTimer  —— 只管 DNS + TCP + 拿到 socket。超时 15s。
+     *   ② responseTimer —— socket 就绪后启动，只管「等响应头」。给一个宽松上限
+     *                      （响应头迟迟不来 = 上游异常），但**不限制响应体传输
+     *                      时长** —— 长任务可以持续输出很久。
+     *
+     * 响应体一旦开始传输就不再计时：由客户端 abort/close 决定何时放弃，
+     * 这正是长连接（AI 对话流）需要的行为。
+     */
+    const connectTimer = setTimeout(
+      () => proxyReq.destroy(new Error('upstream connect timeout')),
+      UPSTREAM_CONNECT_TIMEOUT_MS,
+    );
+    let responseTimer = null;
+    proxyReq.on('socket', () => {
+      clearTimeout(connectTimer);
+      // 连接已建立，转而限制「等响应头」的时间
+      if (responseTimer === null && !proxyReq.destroyed) {
+        responseTimer = setTimeout(
+          () => proxyReq.destroy(new Error('upstream response timeout')),
+          UPSTREAM_RESPONSE_TIMEOUT_MS,
+        );
+      }
+    });
+    /** 两个定时器一起撤，避免泄漏。 */
+    const clearTimers = () => {
+      clearTimeout(connectTimer);
+      if (responseTimer !== null) clearTimeout(responseTimer);
+    };
 
     proxyReq.on('response', (proxyRes) => {
-      clearTimeout(timer);
+      clearTimers();
       res.writeHead(proxyRes.statusCode, proxyRes.statusMessage, stripHopByHop(proxyRes.headers));
       proxyRes.pipe(res);
       proxyRes.on('error', () => res.destroy());
     });
 
     proxyReq.on('error', (err) => {
-      clearTimeout(timer);
+      clearTimers();
       if (!res.headersSent) {
         res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
         res.end(`relay: 无法连接上游 ${TARGET.origin}（${err.code || err.message}）。\n`);
@@ -1501,10 +1595,25 @@ export function createRelay(options = {}) {
       headers,
       agent: false,   // 刻意不复用：升级连接会一直持有 socket
     });
+    // 两段式：connect 只管建连；握手响应头另给宽松上限（101 之后是长连接，不再计时）
     const timer = setTimeout(() => proxyReq.destroy(new Error('upstream connect timeout')), UPSTREAM_CONNECT_TIMEOUT_MS);
+    let responseTimer = null;
+    proxyReq.on('socket', () => {
+      clearTimeout(timer);
+      if (responseTimer === null && !proxyReq.destroyed) {
+        responseTimer = setTimeout(
+          () => proxyReq.destroy(new Error('upstream response timeout')),
+          UPSTREAM_RESPONSE_TIMEOUT_MS,
+        );
+      }
+    });
+    const clearTimers = () => {
+      clearTimeout(timer);
+      if (responseTimer !== null) clearTimeout(responseTimer);
+    };
 
     proxyReq.on('upgrade', (proxyRes, upstreamSocket, head2) => {
-      clearTimeout(timer);
+      clearTimers();
       const h = stripHopByHop(proxyRes.headers);
       h.connection = 'Upgrade';
       if (!h.upgrade) h.upgrade = 'websocket';
@@ -1529,7 +1638,7 @@ export function createRelay(options = {}) {
 
     // 上游拒绝握手（如 403/502）：把状态码透传给客户端
     proxyReq.on('response', (proxyRes) => {
-      clearTimeout(timer);
+      clearTimers();
       const status = proxyRes.statusCode || 502;
       socket.write(`HTTP/1.1 ${status} ${proxyRes.statusMessage || ''}\r\n${serializeHeaders(stripHopByHop(proxyRes.headers))}\r\n`);
       proxyRes.pipe(socket);
@@ -1538,7 +1647,7 @@ export function createRelay(options = {}) {
     });
 
     proxyReq.on('error', () => {
-      clearTimeout(timer);
+      clearTimers();
       if (socket.writable) {
         socket.write('HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nrelay: 无法连接上游 DSH（请确认上游端口在监听）');
         socket.destroy();

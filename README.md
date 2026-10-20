@@ -114,6 +114,30 @@ dsh 自身监听端口（插件版：热读 ctx.webServer；脚本版：由守�
 combo URL、WebSocket 丢首帧）全部源于两份实现的漂移 —— 逐条修库版不能根治，只要副本还在，
 下次修库它就漂移回去。现已删除全部手抄代码，脚本 `import` 库。
 
+### 超时语义：连接与响应分开（0.3.2）
+
+转发到上游时有**两个**独立的超时，不要混为一谈：
+
+| 常量 | 默认 | 管什么 |
+| --- | --- | --- |
+| `UPSTREAM_CONNECT_TIMEOUT_MS` | 15s | DNS + TCP + 等到 socket 就绪。**不覆盖**等响应 |
+| `UPSTREAM_RESPONSE_TIMEOUT_MS` | 5 分钟 | socket 就绪后，等**响应头**的上限。响应体开始传输后即不再计时 |
+
+**为什么必须分开**（0.3.1 及以前的 bug）：
+
+旧实现只有一个 15s 定时器，且直到收到 `response` 才 `clearTimeout` —— 于是「连接超时」
+实际成了**整个请求的总时限**。任何上游响应慢于 15s 的请求都被 `destroy`，回 502
+`upstream connect timeout`（而连接明明是好的）。
+
+受害最重的是 `session/prompt`：它是发起 AI 对话，正常就要几十秒到几分钟。经中转时必然
+在 15s 被掐断，表现成「一操作就失败」，极易被误判成认证问题。
+
+反过来也**不能**简单地把定时器一到 socket 就清掉：上游若是「TCP 连得上但永不应答」
+（进程挂死），请求会永久悬挂。所以拆成两段，各管一段。
+
+响应体传输阶段**不设总时限** —— 长任务/流式输出由客户端 abort/close 决定何时放弃。
+`plugin/tests/long-request.spec.mjs` 锁定了这三条不变量。
+
 ### 认证设计
 
 中转口令是暴露到公网的**唯一**边界，所有认证原语集中在 `lib/auth.js`，宿主半与中转共用。
@@ -219,7 +243,7 @@ plugin/
     locale/{zh,en}.json          插件列表展示元数据
   install.ps1                    自检 / 安装指引 / 旧安装残留清理（须保持 UTF-8 BOM）
   tools/                         诊断、安全审计与开发工具
-  tests/                         六套测试（352 项断言）
+  tests/                         七套测试（367 项断言）
 ```
 
 ---
@@ -227,13 +251,14 @@ plugin/
 ## 开发
 
 ```powershell
-# 六套测试
+# 七套测试
 node plugin\tests\smoke.mjs              # 中转核心      110 项
 node plugin\tests\host-integration.mjs   # 宿主半         79 项
 node plugin\tests\client-half.mjs        # 浏览器半       62 项
 node plugin\tests\dsh-session.spec.mjs   # 会话代签       76 项
 node plugin\tests\password-modes.mjs     # 口令模式        6 项
 node plugin\tests\token-exchange.spec.mjs # token 交换验真 25 项
+node plugin\tests\long-request.spec.mjs  # 长耗时请求     15 项
 
 # 一键自检（manifest 兼容性 + 语法 + 四套测试）
 powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Check
@@ -386,6 +411,17 @@ curl     https://.../api/...   → 000   （浏览器视角，TLS 握手失败�
   子域绑定开启 HSTS Preloading，因此**必须**走 HTTPS。
 - **自有域名方案**：用 Let's Encrypt 等公共 CA 证书替换
   `FrpcWorkingDirectory\<域名>.{crt,key}`，见 <https://doc.natfrp.com/frpc/ssl.html>。
+
+**发消息（`session/prompt`）总是失败，或报 `transport failure for /api/session/prompt`**
+
+先看是不是**超时**而不是认证：0.3.1 及以前有个 bug —— 转发用的 15s 「connect timeout」
+实际上是**整个请求的总时限**，而 prompt 是发起 AI 对话，正常就要几十秒到几分钟，必然被掐断。
+
+- 若状态码是 **502** 且正文含 `upstream connect timeout` → 就是这个 bug，升级到 0.3.2
+- 若状态码是 **401** → 是认证问题，见上一条
+- 自测：`node plugin\tools\probe-long-request.mjs`（长响应能否完整送达）
+
+0.3.2 起拆成两段：连接 15s、等响应头 5 分钟、响应体传输不限时。
 
 **`install.ps1` 报语法错误（`The token '||' is not a valid statement separator` 等）**
 Windows PowerShell 5.1 按系统 ANSI 代码页读无 BOM 脚本，而本脚本是 UTF-8。
