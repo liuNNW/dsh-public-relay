@@ -332,7 +332,19 @@ node plugin\tools\probe-405.mjs
 
 # 4) 查 dsh 运行中的插件状态
 node plugin\tools\inspect-dsh-plugins.mjs sidebar
+
+# 5) 验证 /sidebar/* 是否由 better-sidebar 接管（而非落进 dsh fallback）
+node plugin\tools\verify-sidebar-fixed.mjs
 ```
+
+**怎么区分「路由没注册」与「路由正常但参数不对」**：
+
+| 现象 | 含义 |
+| --- | --- |
+| `405` + **空 body** | dsh fallback —— **路由没注册**（插件宿主半没加载） |
+| `405` + `{"code":"method-error"}` | 路由已注册，是插件自己的方法校验 |
+| `400` + `{"code":"bad-request"}` | 路由已注册，参数不合法 |
+| `200` + `{"ok":true,...}` | 完全正常 |
 
 这在 2026-10-20 的排查里是决定性的：静态分析能看出 dsh 里有 6 处会返 405，
 但**无法确定实际命中哪一处**；钩子一挂上，真相立刻清楚 ——
