@@ -33,10 +33,23 @@ const relayPort = await new Promise((r) => {
   s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); });
 });
 
+/**
+ * 本进程「当前有效」的 dsh 启动令牌。
+ *
+ * 0.3.1 起，`?token=` 交换必须**验真**才放行（见 relay.js 的
+ * verifyDshTokenExchange）：只校验形状会让浏览器书签里那条来自上一次 dsh
+ * 启动的旧 URL 绕过中转口令，随后被 dsh 401 拒绝 —— 用户看到「页面能开、
+ * 操作全挂」，而正确行为是给中转登录页。
+ *
+ * 这里注入一个固定值，让「合法交换」这条正向断言能真正走到上游。
+ */
+const LAUNCH_TOKEN = 'realtoken';
+
 const relay = createRelay({
   getDshEndpoint: () => ({ host: '127.0.0.1', port: up.address().port }),
   getConfig: () => normalizeConfig({ listenPort: relayPort, password: 'CORRECT-PW' }),
   log: () => {},
+  resolveLaunchToken: () => LAUNCH_TOKEN,
 });
 await relay.start();
 
@@ -71,11 +84,19 @@ console.log('1) ?token= 绕过');
   const emptyReached = up.seen.length > before2;
   check('空 token 不被当作令牌交换（未到上游）', !emptyReached, `上游收到 ${up.seen.slice(before2).join(',')}`);
 
-  // 合法的令牌交换（GET / 恰好一个非空 token）必须放行到上游
+  // 合法的令牌交换（GET / 恰好一个 token，且**与当次 launchToken 相等**）必须放行到上游
   const before3 = up.seen.length;
-  const good = await req('/?token=realtoken');
+  const good = await req(`/?token=${LAUNCH_TOKEN}`);
   check('合法令牌交换放行到上游', up.seen.length > before3 && good.body.includes('REACHED'),
     `status=${good.status} seen=${up.seen.slice(before3).join(',')}`);
+
+  // 0.3.1 新增：形状合法但**值不对**（如浏览器书签里上一次启动的旧 token）
+  // 必须被拦住 —— 否则会绕过中转口令、再把用户丢进 dsh 的 401 死路。
+  const before4 = up.seen.length;
+  const stale = await req('/?token=STALE-TOKEN-FROM-LAST-BOOT');
+  check('过期 token 不放到上游', up.seen.length === before4,
+    `上游收到 ${up.seen.slice(before4).join(',')}`);
+  check('过期 token 时返回登录页', stale.body.includes('访问口令'), stale.body.slice(0, 60));
 }
 
 console.log('');

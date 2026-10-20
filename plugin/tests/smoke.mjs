@@ -343,10 +343,16 @@ async function main() {
     forceLoopback: true,
   });
 
+  // 本进程「当前有效」的 dsh 启动令牌。中转会拿它来验真 `?token=` 交换。
+  // 必须与 stub 上游认可的 GOODTOKEN 一致：这样「有效 token」才能一路走到
+  // 上游并换出 cookie，测的才是完整正向链路。
+  const LAUNCH_TOKEN = 'GOODTOKEN';
+
   const relay = createRelay({
     getDshEndpoint: () => ({ host: '127.0.0.1', port: upstream.port }),
     getConfig: () => config,
     log: () => {},
+    resolveLaunchToken: () => LAUNCH_TOKEN,
   });
 
   section('启动');
@@ -406,19 +412,22 @@ async function main() {
     const authed = await request(relayPort, '/api/ping', { headers: { cookie } });
     check('有效 cookie → 放行', authed.status === 200, `got ${authed.status}`);
 
-    // ═══ dsh 启动令牌交换必须被放行（不能被本插件的登录页吃掉）═══
+    // ═══ dsh 启动令牌交换：只有**验真通过**的才放行 ═══
     //
-    // 这是最难排查的一类 bug：dsh 的浏览器认证是一次性 token 交换，
-    // 只在 `GET /?token=...` 完成。若中转的口令认证把它拦下返回登录页，
-    // token 永远到不了 dsh，它的会话 Cookie 一签不出来，用户会一直看到
-    //   dsh web authentication required; reopen the URL printed by dsh web
-    // 而且再怎么输中转口令也没用 —— 那是两套互不相通的认证。
-    section('dsh 启动令牌交换放行');
+    // 两条要求同时成立：
+    //   1. dsh 的浏览器认证是一次性 token 交换，只在 `GET /?token=...` 完成。
+    //      若中转把它拦下返回登录页，token 永远到不了 dsh —— 但这条只在
+    //      **token 确实有效**时才有意义。
+    //   2. 反过来，**过期/伪造**的 token 绝不能被放行。旧实现只看形状就跳过
+    //      中转口令，于是浏览器书签里上一次 dsh 启动的旧 URL 能绕过口令，
+    //      随后被 dsh 以 401 拒绝 —— 用户看到「不用输口令就进去了，但所有
+    //      操作都报 dsh web authentication required」，而正确行为是给登录页。
+    section('dsh 启动令牌交换：验真才放行');
     {
-      // 不带任何 cookie，只带 token：应被转发到上游，而不是返回登录页
-      const swap = await request(relayPort, '/?token=GOODTOKEN');
+      // ① 有效 token：转发到上游，让 dsh 自己签 cookie（不返回登录页）
+      const swap = await request(relayPort, `/?token=${LAUNCH_TOKEN}`);
       const bodyText = swap.body.toString();
-      check('无 cookie 的 ?token= 请求不被本插件拦下（不返回登录页）',
+      check('有效 token 不被本插件拦下（不返回登录页）',
         !bodyText.includes('dsh-public-relay 访问口令'),
         `返回了登录页，正文前 80 字：${bodyText.slice(0, 80)}`);
       check('上游收到了该请求（status=302）', swap.status === 302, `got ${swap.status}`);
@@ -428,7 +437,7 @@ async function main() {
 
       // 关键：cookie 必须绑定「浏览器实际访问的 authority」，而不是上游回环权威。
       // 若这里被改写成 127.0.0.1:<dshPort>，浏览器取不出 cookie，就会一直 401。
-      const hostSeen = upstream.seen.filter((x) => String(x.url).includes('token=GOODTOKEN')).pop();
+      const hostSeen = upstream.seen.filter((x) => String(x.url).includes(`token=${LAUNCH_TOKEN}`)).pop();
       check('转发时保留了浏览器的 Host（供 dsh 按 authority 签 cookie）',
         hostSeen && hostSeen.headers.host === `127.0.0.1:${relayPort}`,
         `上游看到的 Host = ${hostSeen && hostSeen.headers.host}`);
@@ -437,13 +446,18 @@ async function main() {
         issued && issued.authority === `127.0.0.1:${relayPort}`,
         JSON.stringify(issued));
 
-      // 坏 token：上游应给出它自己的报错，而不是被中转改写
+      // ② 过期/错误的 token：**不能**放行，必须落到中转自己的登录页。
+      // 这正是本次修复的核心：别把用户送进「页面能开、操作全 401」的死路。
       const badSwap = await request(relayPort, '/?token=WRONG');
-      check('坏 token 时上游的 401 正文原样透传',
-        badSwap.status === 401 && badSwap.body.toString().includes('authentication required'),
-        `got ${badSwap.status} / ${badSwap.body.toString().slice(0, 60)}`);
+      const badBody = badSwap.body.toString();
+      check('过期 token 被本插件拦下（返回登录页）',
+        badSwap.status === 200 && badBody.includes('dsh-public-relay 访问口令'),
+        `got ${badSwap.status} / ${badBody.slice(0, 60)}`);
+      check('过期 token 不再被转发到上游',
+        upstream.seen.filter((x) => String(x.url).includes('token=WRONG')).length === 0,
+        '上游居然收到了过期 token 请求');
 
-      // 不带 token 的裸 GET / 仍应是本插件的登录页（两层认证都在）
+      // ③ 不带 token 的裸 GET / 仍应是本插件的登录页（两层认证都在）
       const bare = await request(relayPort, '/');
       check('无 token 的裸访问仍是本插件登录页',
         bare.status === 200 && bare.body.toString().includes('dsh-public-relay 访问口令'),

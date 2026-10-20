@@ -507,6 +507,89 @@ function isDshTokenExchange(req) {
 }
 
 /**
+ * 从一次「形状像启动令牌交换」的请求里取出 token 原文。
+ * 只在 isDshTokenExchange 已经返回 true 后调用。
+ */
+function tokenOfExchange(req) {
+  try {
+    const url = new URL(req.url, 'http://placeholder');
+    const tokens = url.searchParams.getAll('token');
+    return tokens.length === 1 ? tokens[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 判断这个 `?token=` 是否**确实是本进程当前有效的启动令牌**。
+ *
+ * ── 为什么必须校验（0.3.1 修复）──
+ *
+ * 旧实现只校验「形状」就放行：只要 `GET /?token=<非空>` 就跳过中转口令认证。
+ * 于是**任何**带 `token` 的 URL —— 包括浏览器书签里那条来自**上一次 dsh 启动**
+ * 的旧 URL —— 都能绕过中转口令。而 dsh 重启后旧 token 必然作废，结果是：
+ *
+ *   用户带旧 token 打开 → 中转放行 → dsh 回 401
+ *   「dsh web authentication required; reopen the URL printed by dsh web.」
+ *
+ * 用户看到的是「不用输口令就进了页面，但所有操作都 401」，而真正该看到的
+ * 是**中转自己的口令登录页**。绕过自家中转口令、把请求丢给一个必然拒绝的
+ * 上游，比直接要求输口令糟糕得多。
+ *
+ * ── 拿不到令牌时为什么选择「不放行」──
+ *
+ * `resolveLaunchToken` 由宿主半注入，从 dsh 的 connection 服务读当前进程的
+ * launchToken。读不到（服务未就绪 / 版本差异 / 权限）时无法验证真伪，此时
+ * **安全默认是不信任**：退化到「要求输入中转口令」。代价是失去 token 免密
+ * 的便利，换来的是永远不会因为一个过期 URL 把人送进死路。
+ *
+ * 比较用恒定时比较：token 是凭据，`===` 会在首个不同字节处提前返回，
+ * 理论上可被时序探测逐字节猜出。
+ *
+ * @param req - 入站请求
+ * @param resolveLaunchToken - () => string|null，返回本进程当前 launchToken
+ * @returns {{ ok: boolean, reason: string }}
+ *   reason ∈ 'not-exchange' | 'verified' | 'unavailable' | 'mismatch'
+ */
+function verifyDshTokenExchange(req, resolveLaunchToken) {
+  if (!isDshTokenExchange(req)) return { ok: false, reason: 'not-exchange' };
+  const token = tokenOfExchange(req);
+  if (token === null) return { ok: false, reason: 'mismatch' };
+
+  let expected = null;
+  try {
+    expected = typeof resolveLaunchToken === 'function' ? resolveLaunchToken() : null;
+  } catch {
+    expected = null;
+  }
+  if (typeof expected !== 'string' || expected === '') {
+    return { ok: false, reason: 'unavailable' };
+  }
+
+  const a = Buffer.from(token, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return { ok: false, reason: 'mismatch' };
+  return crypto.timingSafeEqual(a, b)
+    ? { ok: true, reason: 'verified' }
+    : { ok: false, reason: 'mismatch' };
+}
+
+/**
+ * `?token=` 交换被拒的计数与最近原因。
+ *
+ * 为什么要有：这个缺陷（带过期 token 的 URL 绕过口令、结果撞上 dsh 的 401）
+ * 的症状与「转发出错」长得一样，仅凭 HTTP 状态码分不清。把「拒绝过几次、
+ * 最近一次为什么」暴露到状态面板上，下一次同类问题能一眼看出。
+ *
+ * 只存计数、时间与原因枚举 —— **绝不存 token 原值或 query**：那是凭据。
+ */
+const tokenExchangeStats = {
+  rejects: 0,
+  lastReason: null,
+  lastRejectAt: null,
+};
+
+/**
  * 这个未认证请求是否应该看到登录页（而不是裸 401）。
  *
  * 两种情形：浏览器请求文档（Accept 含 text/html），或直接访问站点根路径。
@@ -515,8 +598,18 @@ function isDshTokenExchange(req) {
  */
 function wantsLoginPage(req) {
   if (req.method !== 'GET') return false;
-  const url = req.url === undefined ? '/' : req.url;
-  if (url === '/' || url === '/index.html' || url.startsWith('/?')) return true;
+  const raw = req.url === undefined ? '/' : req.url;
+  /*
+   * 按 **pathname** 判断，不按整条 URL 前缀。
+   *
+   * 旧实现里有 `url.startsWith('/?')`，意思是「根路径带任意 query 就当文档请求」。
+   * 这在 `?token=` 被单独放行之后几乎不会命中，而且语义是歪的：判「要不要
+   * 给登录页」应当只看请求的是什么**资源**，与查询串无关。
+   */
+  let pathname = raw;
+  const cut = raw.indexOf('?');
+  if (cut !== -1) pathname = raw.slice(0, cut);
+  if (pathname === '/' || pathname === '/index.html') return true;
   const accept = req.headers.accept;
   return typeof accept === 'string' && accept.includes('text/html');
 }
@@ -560,12 +653,34 @@ function isSecureRequest(req) {
  * @param limiter - 实例级登录限流表（createLoginLimiter 的返回值）
  * @returns true 表示已放行，false 表示本函数已接管响应。
  */
-function authGate(req, res, socket, auth, password, log, limiter) {
+function authGate(req, res, socket, auth, password, log, limiter, tokenCheck) {
   if (!auth) return true;
 
-  // dsh 的启动令牌交换优先放行（见 isDshTokenExchange 注释）。
-  // 注意：日志里**只记 pathname**，绝不记 query —— 那里面是一次性启动令牌。
-  if (isDshTokenExchange(req)) {
+  /*
+   * dsh 的启动令牌交换优先放行 —— 但**必须验真**（见 verifyDshTokenExchange）。
+   *
+   * 只有拿到本进程当前 launchToken 且与之相等才放行；否则：
+   *   · 不把请求丢给上游（那必然 401，且对用户是「页面能开、操作全挂」的死路）
+   *   · 落到下面的常规「未认证」出口 → 展示中转口令登录页
+   *
+   * 日志里**只记 reason，不记 token 与 query** —— 那是一次性凭据。
+   */
+  if (tokenCheck !== undefined && tokenCheck !== null) {
+    if (tokenCheck.ok) {
+      log?.('info', '放行 dsh 启动令牌交换（已验真）');
+      return true;
+    }
+    if (tokenCheck.reason !== 'not-exchange') {
+      // 形状像交换但验不过：计数 + 记原因，供状态面板观察。
+      // 只记 reason，不记 token 与 query —— 那是一次性凭据。
+      tokenExchangeStats.rejects += 1;
+      tokenExchangeStats.lastReason = tokenCheck.reason;
+      tokenExchangeStats.lastRejectAt = Date.now();
+      log?.('warn', `拒绝 ?token= 交换（${tokenCheck.reason}），改为要求中转口令`);
+    }
+  } else if (isDshTokenExchange(req)) {
+    // 没有校验器（老调用点，例如测试里直接调 authGate）：
+    // 主路径已一律传 tokenCheck，这里只为兼容既有调用形状。
     log?.('info', '放行 dsh 启动令牌交换');
     return true;
   }
@@ -683,10 +798,14 @@ function authGate(req, res, socket, auth, password, log, limiter) {
  * @param options.getConfig      - () => 归一化后的配置
  * @param options.log            - (level, message) => void，可选
  * @param options.sessionSigner  - dsh 会话代签器；提供且 autoSession 开启时补签会话 Cookie
+ * @param options.resolveLaunchToken - () => string|null，本进程当前 dsh 启动令牌。
+ *   用于**验真** `?token=` 交换；拿不到就一律要求中转口令（安全默认）。
  * @returns { start, stop, status }
  */
 export function createRelay(options = {}) {
-  const { getDshEndpoint, getConfig, log = () => {}, sessionSigner = null } = options;
+  const {
+    getDshEndpoint, getConfig, log = () => {}, sessionSigner = null, resolveLaunchToken = null,
+  } = options;
 
   /** @type {import('node:http').Server|null} */
   let server = null;
@@ -1073,13 +1192,21 @@ export function createRelay(options = {}) {
   // ── 普通 HTTP 代理 ──
   function handleRequest(req, res, auth, c) {
     requestCount += 1;
-    if (!authGate(req, res, null, auth, c.password, log, loginLimiter)) return;
+    /*
+     * 令牌校验只算一次，结果同时给 authGate（是否放行）与下面的转发分支用。
+     *
+     * 注意：authGate 通过后，走到这里的 `?token=` 一定是**已验真**的（否则
+     * 它已经在 authGate 里被降级成中转登录页并 return 了）。所以下面的
+     * forwardTokenExchange 分支只可能是真的交换，不再是任意 token 的后门。
+     */
+    const tokenCheck = verifyDshTokenExchange(req, resolveLaunchToken);
+    if (!authGate(req, res, null, auth, c.password, log, loginLimiter, tokenCheck)) return;
 
     const TARGET = target();
 
     // 令牌交换且不代签 → 保留浏览器原始 authority，让 dsh 自己按它签 cookie。
     // 代签生效时不需要这条路（详见 forwardTokenExchange 的说明）。
-    if (isDshTokenExchange(req) && !(sessionSigner && c.autoSession !== false && c.password)) {
+    if (tokenCheck.ok && !(sessionSigner && c.autoSession !== false && c.password)) {
       return forwardTokenExchange(req, res, TARGET);
     }
 
@@ -1423,7 +1550,7 @@ export function createRelay(options = {}) {
 
   function handleUpgrade(req, socket, head, auth, c) {
     socket.on('error', () => socket.destroy());
-    if (!authGate(req, null, socket, auth, c.password, log, loginLimiter)) return;
+    if (!authGate(req, null, socket, auth, c.password, log, loginLimiter, verifyDshTokenExchange(req, resolveLaunchToken))) return;
 
     const TARGET = target();
 
@@ -1684,6 +1811,26 @@ export function createRelay(options = {}) {
       },
       startedAt: running ? startedAt : null,
       uptimeMs: running ? Date.now() - startedAt : 0,
+      /*
+       * `?token=` 交换的验真状态。
+       *
+       * `verifiable=false` 意味着中转拿不到本进程 launchToken，此时所有
+       * `?token=` 都会被拒、一律要求中转口令 —— 这是**安全默认**，但用户
+       * 会失去「用 dsh 打印的 URL 免密进入」的便利，所以必须能观察到。
+       */
+      tokenExchange: {
+        verifiable: (() => {
+          try {
+            const t = typeof resolveLaunchToken === 'function' ? resolveLaunchToken() : null;
+            return typeof t === 'string' && t !== '';
+          } catch {
+            return false;
+          }
+        })(),
+        rejects: tokenExchangeStats.rejects,
+        lastReason: tokenExchangeStats.lastReason,
+        lastRejectAt: tokenExchangeStats.lastRejectAt,
+      },
       lastError: effectiveError,
     };
   }

@@ -153,6 +153,37 @@ combo URL、WebSocket 丢首帧）全部源于两份实现的漂移 —— 逐�
 - 凭据读取失败或连续 10 分钟读不到 → 停止注入，退回「用 `?token=` 登录」，不会把人锁在门外
 - ⚠ 改中转口令**不会**让已签发的 dsh 会话失效 —— 它们由 dsh 的持久密钥签名，不是由口令签名
 
+### `?token=` 放行必须验真（0.3.1）
+
+dsh 的浏览器认证是**一次性令牌交换**：每次启动随机生成一个 launchToken，只在
+`GET /?token=<它>` 上接受。中转需要放行这类请求，否则 token 到不了 dsh。
+
+但**只校验形状是不够的**。0.3.0 及以前的实现是「`GET /` + 恰好一个非空 token →
+跳过中转口令」。于是浏览器书签里那条来自**上一次 dsh 启动**的旧 URL 也能绕过中转口令，
+随后必然被 dsh 以 401 拒绝：
+
+```
+dsh web authentication required; reopen the URL printed by dsh web.
+```
+
+用户看到的症状是「不用输口令就进去了，但所有操作都报错」—— 而正确行为是给中转登录页。
+绕过自家中转口令、把请求丢给一个必然拒绝的上游，比直接要求输口令糟糕得多。
+
+现在的规则：
+
+| 情况 | 行为 |
+| --- | --- |
+| token 与**当次** launchToken 相等（恒定时比较） | 放行，让 dsh 完成交换 |
+| token 不相等（过期/伪造/书签残留） | **拦截**，返回中转登录页，不转发 |
+| 拿不到 launchToken（服务未就绪等） | **一律拦截**（安全默认：要求口令） |
+| 多 token / 空 token / 非 GET / 非 `/` 路径 | 拦截 |
+
+launchToken 从 dsh 的 `connection` 服务（`ctx.get('connection').browserAuth.launchToken`）
+读取 —— 中转是跑在同一进程内的插件，可直接取到。读不到时宁可多要一次口令，
+也不让一个过期 URL 把人送进死路。
+
+拒绝次数与最近原因会出现在状态面板的 `tokenExchange` 字段里（只报计数与枚举，**不报 token 原值**）。
+
 ### `force-loopback` 怎么改写
 
 dsh 的客户端连接模块里有：
@@ -188,7 +219,7 @@ plugin/
     locale/{zh,en}.json          插件列表展示元数据
   install.ps1                    自检 / 安装指引 / 旧安装残留清理（须保持 UTF-8 BOM）
   tools/                         诊断、安全审计与开发工具
-  tests/                         五套测试（332 项断言）
+  tests/                         六套测试（352 项断言）
 ```
 
 ---
@@ -196,12 +227,13 @@ plugin/
 ## 开发
 
 ```powershell
-# 五套测试
-node plugin\tests\smoke.mjs              # 中转核心      109 项
+# 六套测试
+node plugin\tests\smoke.mjs              # 中转核心      110 项
 node plugin\tests\host-integration.mjs   # 宿主半         79 项
 node plugin\tests\client-half.mjs        # 浏览器半       62 项
 node plugin\tests\dsh-session.spec.mjs   # 会话代签       76 项
 node plugin\tests\password-modes.mjs     # 口令模式        6 项
+node plugin\tests\token-exchange.spec.mjs # token 交换验真 25 项
 
 # 一键自检（manifest 兼容性 + 语法 + 四套测试）
 powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Check
@@ -213,6 +245,9 @@ node plugin\tools\check-compat.mjs plugin\dsh-public-relay\package.json
 node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" grep "<正则>" [路径前缀]
 node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" ls  [路径前缀]
 node plugin\tools\asar.mjs "F:\软件\dsh\resources\app.asar" cat <内部路径>
+
+# 探测「中转能否从插件上下文取到 dsh 的 launchToken」（token 验真的前提）
+node plugin\tools\probe-launch-token.mjs
 ```
 
 ### 安全审计工具
@@ -279,6 +314,18 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 **经隧道访问时一直提示 `dsh web authentication required`**
 插件状态区的「自动会话」指标会直接说明是「口令为空被禁用」还是「读不到密钥」。
 读不到密钥时确认 `$DSH_HOME/.credentials.yaml` 含 `client-connection/browser-session` 记录。
+
+**不带口令就进了页面，但所有操作都 401、控制台报 `transport failure for /api: HTTP 401`**
+
+两种可能，按顺序排查：
+
+1. **地址栏里带着 `?token=...`**（最常见）。那条 URL 来自**上一次 dsh 启动**，
+   token 早已作废。旧版中转会放行它（只校验形状），于是绕过了中转口令、
+   直接把请求丢给 dsh → dsh 回 401。
+   **做法**：把 `?token=` 及之后全删掉，只访问 `https://<你的隧道域名>:<端口>/`，
+   输入中转口令。0.3.1 起中转会自己拦下过期 token 并给登录页，不再有这条死路。
+   状态面板的 `tokenExchange.rejects` 能确认是否发生了这种情况。
+2. **`autoSession` 没生效**（口令为空、或读不到密钥）。看状态区「自动会话」那一行的原因。
 
 **`install.ps1` 报语法错误（`The token '||' is not a valid statement separator` 等）**
 Windows PowerShell 5.1 按系统 ANSI 代码页读无 BOM 脚本，而本脚本是 UTF-8。

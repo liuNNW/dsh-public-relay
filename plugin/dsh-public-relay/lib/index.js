@@ -241,8 +241,57 @@ export function apply(ctx, entryConfig) {
   // ── dsh 会话代签器 ──
   const sessionSigner = createSessionSigner({ log });
 
+  /**
+   * 取 dsh 本进程当前的启动令牌（launchToken），用于**验真** `?token=` 交换。
+   *
+   * ── 为什么需要 ──
+   *
+   * dsh 每次启动生成一个随机 launchToken，只在 `GET /?token=<它>` 上接受一次
+   * 交换。中转旧实现只看「形状」（`GET /` + 一个非空 token）就跳过自己的口令
+   * 认证 —— 于是浏览器书签里那条**上一次启动**的旧 URL 也能绕过中转口令，
+   * 随后必然被 dsh 以 401 拒绝。用户看到的是「不用输口令就进去了，但所有
+   * 操作都报 dsh web authentication required」，而正确行为应是给中转登录页。
+   *
+   * ── 从哪里取 ──
+   *
+   * dsh 的 connection 服务（`ctx.get('connection')`，HostConnectionService）
+   * 上挂着 `browserAuth.launchToken`。中转是跑在同一进程里的插件，所以能直接
+   * 读到它 —— 不需要读日志、不需要 hook 进程。
+   *
+   * 拿不到就返回 null：调用方（relay）会按「不可验证 → 一律要求中转口令」
+   * 处理。这是安全默认，代价只是失去 token 免密的便利。
+   *
+   * @returns {string|null}
+   */
+  function resolveLaunchToken() {
+    const candidates = [
+      () => ctx.get?.('connection'),
+      () => ctx.connection,
+      () => ctx.root?.get?.('connection'),
+      () => ctx.root?.connection,
+    ];
+    for (const read of candidates) {
+      let service;
+      try {
+        service = read();
+      } catch {
+        continue;   // 这一层不可用，试下一层
+      }
+      if (service === null || typeof service !== 'object') continue;
+      try {
+        const token = service.browserAuth?.launchToken;
+        if (typeof token === 'string' && token !== '') return token;
+      } catch {
+        /* 属性不可读，继续 */
+      }
+    }
+    return null;
+  }
+
   // ── 中转实例 ──
-  const relay = createRelay({ getDshEndpoint, getConfig: readConfig, log, sessionSigner });
+  const relay = createRelay({
+    getDshEndpoint, getConfig: readConfig, log, sessionSigner, resolveLaunchToken,
+  });
 
   /**
    * 配置变化时联动中转。

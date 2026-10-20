@@ -217,6 +217,15 @@ JS（检查 dsh 是否改成了压缩返回 —— 日志会有「上游响应�
 不用猜。读不到密钥时确认 `$DSH_HOME/.credentials.yaml` 存在且含
 `client-connection/browser-session` 记录。
 
+**不带口令就进了页面，但所有操作都 401（控制台 `transport failure for /api: HTTP 401`）**
+
+先看地址栏有没有 `?token=...`。那条 URL 来自**上一次 dsh 启动**，token 已作废；
+0.3.0 及以前中转只校验形状就放行，于是绕过中转口令、把请求丢给 dsh → 401。
+把 `?token=` 之后整段删掉，只访问 `https://<隧道域名>:<端口>/` 并输入中转口令。
+
+0.3.1 起中转会**验真** token（与当次 launchToken 恒定时比较），过期的一律拦成
+登录页，不再有这条死路。状态区 `tokenExchange` 可确认是否发生过拦截。
+
 **`install.ps1` 报语法错误（`The token '||' is not a valid statement separator` 等）**
 Windows PowerShell 5.1 按系统 ANSI 代码页读无 BOM 脚本，而本脚本是 UTF-8。
 保持该文件为 **UTF-8 带 BOM** 即可；用 PowerShell 7 跑不受影响。
