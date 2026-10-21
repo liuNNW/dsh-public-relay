@@ -9,7 +9,7 @@
 | **DSH 插件**（推荐） | 日常使用。跑在 dsh 进程内，设置页里看端口、随时开关 | [`plugin/dsh-public-relay`](plugin/dsh-public-relay) |
 | **独立脚本** | 不想装插件、或要用它的 `dsh web` 守护 | [`dsh-public-relay.js`](dsh-public-relay.js) |
 
-- **当前版本**：`0.3.2`
+- **当前版本**：`0.3.3`
 - **npm**：`dsh-public-relay`
 - **仓库**：<https://github.com/liuNNW/dsh-public-relay>
 - **许可证**：MIT
@@ -417,6 +417,63 @@ node plugin\tools\verify-sidebar-fixed.mjs
 它的 `/sidebar/*` 路由全部没注册，客户端的 POST 掉进 fallback → 405。
 升级到 0.28.0 即修复。
 
+### 间歇性 401 排查（最难的一类）
+
+症状：偶尔出现 `dsh web authentication required` 或
+`transport failure for /api/...: HTTP 401`，刷新页面后恢复，单次测试永远复现不了。
+
+**第一步：看观测记录**（0.3.3 起 relay 记录每一次上游 401）
+
+```powershell
+node plugin\tools\verify-upstream-401-observability.mjs   # 验证观测本身可用
+node plugin\tools\watch-relay-flap.mjs 120 400            # 持续采样，捕捉故障窗口
+```
+
+`status.upstream401` 里有 `count`、`last`、`samples`（最近 10 条），
+每条含方法、路径、**我们实际注入了哪些 dsh-auth cookie**（名字哈希 + 版本 +
+authority + issuedAt/expiresAt + 剩余时长）—— 只记结构，不记签名原文。
+
+**第二步：核对 dsh 接受 cookie 的硬边界**（实测得出）
+
+```powershell
+node plugin\tools\probe-dsh-cookie-bounds.mjs    # 有效期跨度 / 时钟偏移的边界扫描
+node plugin\tools\probe-boundary-flap.mjs 200    # 连续压边界，看是否有抖动
+node plugin\tools\diagnose-secret-mismatch.mjs   # 逐条核对五条件
+```
+
+实测边界（dsh 0.2.1-rc.2）：
+
+| 条件 | 边界 | 说明 |
+| --- | --- | --- |
+| `expiresAt - issuedAt` | **> 30 天** → 401 | 中转签 30 天，恰好压线（`=30` 通过） |
+| `issuedAt` 相对 dsh 的 now | **> 0ms** → 401 | 正向偏差 1ms 即拒 |
+| `payload.authority` vs Host | 不等 → 401 | 见下面 audience 一节 |
+
+**第三步：确认 HTTP/HTTPS 的 audience 错配**（最常见的真凶）
+
+```powershell
+node plugin\tools\probe-tunnel-401.mjs
+```
+
+dsh 的 `requestAudience(headers, secure)`：
+
+```js
+return secure ? url.origin : url.host;   // "https://host:port"  vs  "host:port"
+```
+
+**两者是不同名字的 cookie**：
+
+```
+secure=false → dsh-auth-0exPercd…   (authority = 127.0.0.1:19387)
+secure=true  → dsh-auth-Fvz3nzXs…   (authority = https://127.0.0.1:19387)
+```
+
+实测：给 dsh 一个 `https://` 形态的 cookie，它回的就是
+`dsh web authentication required`（与用户看到的文案完全一致）。
+
+中转签 cookie 用 `TARGET.authority`（HTTP 形态），而 dsh 的 secure 取
+`webServer.protocol === "https:"`。**两边一致时正常；不一致就全面 401。**
+
 ### 插件安装 / 清理
 
 ```powershell
@@ -451,6 +508,7 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 
 | 版本 | 关键变化 |
 | --- | --- |
+| `0.3.3` | **观测**：记录每一次「上游 401」的完整上下文（方法/路径/注入的 dsh-auth cookie 结构），`status.upstream401` 可查。同时补齐间歇性 401 的排查工具链与 dsh 接受 cookie 的实测边界 |
 | `0.3.2` | **修复**：15s「connect timeout」实为整个请求总时限，会掐断 `session/prompt` 等长耗时调用。拆成两段：连接 15s / 等响应头 5 分钟 / 响应体传输不限时 |
 | `0.3.1` | **修复**：带过期 `?token=` 的 URL 可绕过中转口令（只校验形状），随后被 dsh 401。改为与当次 launchToken 恒定时比较，过期一律拦成登录页 |
 | `0.3.0` | WebSocket 帧级代理 + `permessage-deflate` 压缩（会话历史压缩约 4.8x） |

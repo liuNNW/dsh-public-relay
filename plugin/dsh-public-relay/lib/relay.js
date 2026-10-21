@@ -869,6 +869,85 @@ export function createRelay(options = {}) {
   };
 
   /**
+   * 上游 401 的观测记录（只保留最近 N 条，供状态面板与日志用）。
+   *
+   * 存在理由见 recordUpstream401 的说明：偶发 401 在单次测试里永远复现不了，
+   * 必须有「事发当时」的证据留存。
+   */
+  const upstream401s = { count: 0, last: null, samples: [] };
+
+  /**
+   * 记录一次「上游以 401 拒绝了我们的转发」。
+   *
+   * 这是纯观测：不改变请求、不改变响应、不影响任何判定。
+   * 记录内容只够定位问题，不含可用凭据（不写 cookie 签名原文）。
+   *
+   * @param req - 浏览器侧的入站请求
+   * @param proxyRes - 上游的响应
+   */
+  function recordUpstream401(req, proxyRes) {
+    upstream401s.count += 1;
+    try {
+      const forwarded = proxyRes.req;
+      const sentCookie = String(forwarded?.getHeader?.('cookie') ?? '');
+      /** 只留 dsh-auth 的「名字前 8 位 + payload 时间字段」，不记签名。 */
+      const authCookies = sentCookie.split(';')
+        .map((s) => s.trim())
+        .filter((s) => s.startsWith('dsh-auth-'))
+        .map((s) => {
+          const eq = s.indexOf('=');
+          const name = eq > 0 ? s.slice(0, eq) : s;
+          const value = eq > 0 ? s.slice(eq + 1) : '';
+          const info = { nameHash: name.replace('dsh-auth-', '').slice(0, 8), version: null, authority: null, issuedAt: null, expiresAt: null };
+          const parts = value.split('.');
+          if (parts.length === 3) {
+            info.version = parts[0];
+            try {
+              const p = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+              info.authority = p.authority ?? null;
+              info.issuedAt = p.issuedAt ?? null;
+              info.expiresAt = p.expiresAt ?? null;
+              if (typeof p.issuedAt === 'number' && typeof p.expiresAt === 'number') {
+                info.ageMs = Date.now() - p.issuedAt;
+                info.remainMs = p.expiresAt - Date.now();
+              }
+            } catch { /* payload 解析失败就只留名字 */ }
+          }
+          return info;
+        });
+
+      const entry = {
+        at: new Date().toISOString(),
+        method: req.method,
+        path: (req.url ?? '').split('?')[0],
+        upstreamAuthority: TARGET_AUTHORITY_FOR_LOG(),
+        sentDshCookies: authCookies,
+        sentRelaySession: sentCookie.includes('relay_session='),
+        clientHost: req.headers.host ?? null,
+        clientOrigin: req.headers.origin ?? null,
+      };
+      upstream401s.last = entry;
+      upstream401s.samples.push(entry);
+      if (upstream401s.samples.length > 10) upstream401s.samples.shift();
+
+      log('warn', `[upstream-401] ${entry.method} ${entry.path} — 上游拒绝本次转发`
+        + `（注入 ${authCookies.length} 条 dsh-auth，authority=`
+        + `${authCookies.map((c) => c.authority ?? '?').join(',') || '无'}）`);
+    } catch (err) {
+      log('warn', `[upstream-401] 记录失败：${err?.message || err}`);
+    }
+  }
+
+  /** 状态里报告上游 authority（recordUpstream401 用，容忍 target() 抛错）。 */
+  function TARGET_AUTHORITY_FOR_LOG() {
+    try {
+      return target().authority;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * 打给上游的 keep-alive 连接池。
    *
    * 旧实现每处转发都写 `agent: false`（= 不复用、每个请求新建 TCP）。在
@@ -1324,6 +1403,21 @@ export function createRelay(options = {}) {
 
     proxyReq.on('response', (proxyRes) => {
       clearTimers();
+      /*
+       * 上游 401 诊断（2026-10-21）。
+       *
+       * 用户报「发提示词时偶发 401，刷新页面才恢复」。这类故障最难查，因为：
+       *   · relay 对上游 401 是**原样透传**，此前不留任何痕迹；
+       *   · 偶发意味着单次测试永远复现不了。
+       *
+       * 这里在不改变任何行为的前提下，把「上游拒绝了我们的转发」记下来：
+       * 请求方法/路径、我们实际注入了哪些 dsh-auth-* cookie（含其 payload
+       * 里的 authority / issuedAt / expiresAt）、以及是否走了代签。
+       *
+       * 只记 cookie 的**结构**（名字哈希前 8 位 + 时间字段），不记签名原文，
+       * 避免把可用凭据写进日志。
+       */
+      if (proxyRes.statusCode === 401) recordUpstream401(req, proxyRes);
       res.writeHead(proxyRes.statusCode, proxyRes.statusMessage, stripHopByHop(proxyRes.headers));
       proxyRes.pipe(res);
       proxyRes.on('error', () => res.destroy());
@@ -1920,6 +2014,17 @@ export function createRelay(options = {}) {
       },
       startedAt: running ? startedAt : null,
       uptimeMs: running ? Date.now() - startedAt : 0,
+      /*
+       * 上游 401 观测。
+       *
+       * `count` 累加自本次中转启动；`last` 是最近一次的完整上下文。
+       * 偶发 401 在单次测试里复现不了，这里是唯一的「事发当时」证据。
+       */
+      upstream401: {
+        count: upstream401s.count,
+        last: upstream401s.last,
+        samples: upstream401s.samples,
+      },
       /*
        * `?token=` 交换的验真状态。
        *
