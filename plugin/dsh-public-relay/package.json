@@ -1,6 +1,6 @@
 {
   "name": "dsh-public-relay",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "把本机 dsh 端口反向代理出去：Host/Origin 改写过信任栅栏、可选强制回环改写（公网也能看到插件列表）、HMAC 口令认证 + 滑动窗口限流、代签 dsh 会话 Cookie（只输中转口令即可进入）、WebSocket 帧级代理与压缩；配合内网穿透可直接访问 dsh 界面。 / Reverse-proxy the local DeepSeek Harness web port out through a tunnel.",
   "type": "module",
   "main": "lib/index.js",

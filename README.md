@@ -9,7 +9,7 @@
 | **DSH 插件**（推荐） | 日常使用。跑在 dsh 进程内，设置页里看端口、随时开关 | [`plugin/dsh-public-relay`](plugin/dsh-public-relay) |
 | **独立脚本** | 不想装插件、或要用它的 `dsh web` 守护 | [`dsh-public-relay.js`](dsh-public-relay.js) |
 
-- **当前版本**：`0.3.3`
+- **当前版本**：`0.3.4`
 - **npm**：`dsh-public-relay`
 - **仓库**：<https://github.com/liuNNW/dsh-public-relay>
 - **许可证**：MIT
@@ -164,17 +164,35 @@ combo URL、WebSocket 丢首帧）全部源于两份实现的漂移 —— 逐�
 ### 管理路由的鉴权
 
 `/dsh-public-relay/config` 与 `/dsh-public-relay/control` 改的是监听地址、上游目标
-和口令，**必须比普通请求更严**。它们要求：
+和口令，**必须比普通请求更严**。通过条件（满足其一）：
 
-1. 中转口令派生的 bearer token（`Authorization: Bearer …`）或有效的 `relay_session` Cookie
-2. 同源（`Origin` 的 host 等于 `Host`），或对端是回环地址
+1. **桌面外壳**：`Origin` 精确等于 `dsh-app://app`，且对端是回环
+2. 中转口令派生的 bearer token（`Authorization: Bearer …`）或有效的 `relay_session` Cookie
+3. 口令为空时：仅回环对端
 
-这两条缺一不可：仅靠 Origin 是不够的 —— 中转会把每个转发请求的 `Host`/`Origin` 改写成
-上游回环权威，所以经公网进来的请求在 dsh 侧「Origin == Host」按构造必然成立。反过来，
-仅靠 bearer 也不够：无口令时中转允许无认证转发，那时就只剩「对端必须是回环」这一条。
+此外**任何**一条都还要过同源校验（`Origin` 的 host 等于 `Host`，或对端是回环 / 无 Origin）。
+
+仅靠 Origin 是不够的 —— 中转会把每个转发请求的 `Host`/`Origin` 改写成上游回环权威，
+所以经公网进来的请求在 dsh 侧「Origin == Host」按构造必然成立。
+
+> **为什么桌面外壳要豁免**（0.3.4）：设置页的每个按钮都走这两条路由，而它的 `fetch`
+> **拿不到口令** —— 口令是 write-only、从不回填，前端无从派生 bearer。0.2.3 加入
+> bearer 要求时没有同步给前端补上凭据，于是口令一旦设置，设置页写操作**永远 403**
+> （表现为「保存/停用点了没反应」）。
+>
+> 豁免是安全的：`dsh-app://app` 是 Electron 注册的私有 scheme，只有桌面外壳页面能产生
+> 这个 Origin，网页**无法**跨源伪造它（浏览器按页面来源写入，不是请求方可设的字符串）；
+> 同时仍要求对端回环。公网面没有放宽 —— 中转会把 Origin 改写掉，永远不等于该值。
+>
+> 这个 bug 之所以逃过测试：所有管理路由用例都额外带了 `adminAs`（替前端补了一个真实
+> 前端从未发送的 bearer）。0.3.4 起的回归用例**故意不带凭据**，复刻真实调用形状。
+
+浏览器里直接改设置（`http://127.0.0.1:端口` 或经隧道）会走第 2 条：前端在口令框填过值后
+会用它派生 token 并在本页内记住。口令框为空且本页还没派生过时会收到一条明确提示
+（不再只是 `HTTP 403`）。
 
 > **无口令 ≠ 管理路由开放**。口令为空且监听 `0.0.0.0` 时，管理路由对非回环来源一律 403；
-> 本机 UI 与 `relay_status` / `relay_control` 工具不受影响。
+> 桌面外壳与本机 UI 不受影响，`relay_status` / `relay_control` 工具也不受影响。
 
 ### 会话代签的权限边界
 
@@ -251,7 +269,7 @@ plugin/
     locale/{zh,en}.json          插件列表展示元数据
   install.ps1                    自检 / 安装指引 / 旧安装残留清理（须保持 UTF-8 BOM）
   tools/                         诊断、安全审计与开发工具
-  tests/                         七套测试（367 项断言）
+  tests/                         七套测试（387 项断言）
 ```
 
 ---
@@ -261,8 +279,8 @@ plugin/
 ```powershell
 # 七套测试
 node plugin\tests\smoke.mjs              # 中转核心      110 项
-node plugin\tests\host-integration.mjs   # 宿主半         79 项
-node plugin\tests\client-half.mjs        # 浏览器半       62 项
+node plugin\tests\host-integration.mjs   # 宿主半         89 项
+node plugin\tests\client-half.mjs        # 浏览器半       66 项
 node plugin\tests\dsh-session.spec.mjs   # 会话代签       76 项
 node plugin\tests\password-modes.mjs     # 口令模式        6 项
 node plugin\tests\token-exchange.spec.mjs # token 交换验真 25 项
@@ -298,6 +316,7 @@ node plugin\tools\check-auth-chain.mjs               # 逐层核对认证链路
 node plugin\tools\soak-relay-auth.mjs [轮数] [并发]    # 高频采样，捕间歇性 401
 node plugin\tools\probe-prompt.mjs                   # /api 各端点经中转 vs 直连对比
 node plugin\tools\fix-credentials-version.mjs        # 修 credentials 里的版本字段
+node plugin\tools\probe-admin-403.mjs                # 管理路由 403 判定矩阵 + 快照 hasPassword 核对
 ```
 
 #### ③ 隧道 / 连通性
@@ -508,6 +527,7 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 
 | 版本 | 关键变化 |
 | --- | --- |
+| `0.3.4` | **修复**：设置页「保存/停用」必现 `HTTP 403` —— 管理路由要求 bearer，而前端从未发送。桌面外壳（`dsh-app://app`）改为免凭据，前端补上 bearer 派生（浏览器场景用）。同时修 `hasPassword` 位置错误导致的「口令为空」误报 |
 | `0.3.3` | **观测**：记录每一次「上游 401」的完整上下文（方法/路径/注入的 dsh-auth cookie 结构），`status.upstream401` 可查。同时补齐间歇性 401 的排查工具链与 dsh 接受 cookie 的实测边界 |
 | `0.3.2` | **修复**：15s「connect timeout」实为整个请求总时限，会掐断 `session/prompt` 等长耗时调用。拆成两段：连接 15s / 等响应头 5 分钟 / 响应体传输不限时 |
 | `0.3.1` | **修复**：带过期 `?token=` 的 URL 可绕过中转口令（只校验形状），随后被 dsh 401。改为与当次 launchToken 恒定时比较，过期一律拦成登录页 |
@@ -606,10 +626,33 @@ Windows PowerShell 5.1 按系统 ANSI 代码页读无 BOM 脚本，而本脚本�
 > ⚠ **编辑 `install.ps1` 时必须补回 BOM**。多数编辑器与本环境的文件编辑工具写入时会
 > 剥掉它，一旦剥掉脚本在 PowerShell 5.1 下会静默变成无法执行。这是该文件的存活条件。
 
-**403（管理路由被拒）**
-`/config`、`/control` 需要 bearer token 或 `relay_session` Cookie。从公网经隧道访问时，
-宿主半的 Origin 检查会因中转改写过 Host 而失效 —— 请带上口令派生的 token 调用。
-本机 UI 与工具调用不受影响。
+**设置页「保存 / 停用」点了没反应，或报 `HTTP 403`**
+
+0.3.3 及以前这是个必现 bug（不是配置问题）：口令一旦设置，管理路由就要求 bearer，
+而前端 `call()` 从来没发过 bearer → **写操作永远 403**，状态却照常能读，
+于是表现为「看得见配置、改不动」。
+
+```powershell
+# 一条命令判定当前运行实例是旧代码还是已修复
+node plugin\tools\probe-admin-403.mjs
+```
+
+看两处输出：
+
+- `桌面壳 dsh-app://app（无凭据）` 是 `200` → 已修复；仍是 `403` → 运行中的插件还是旧代码
+- `快照 config.hasPassword` 是 `true` → 已修复；`undefined` → 旧代码
+
+旧代码只能靠**完全退出 dsh 再启动**（含系统托盘）来加载新版本。
+
+修复后的规则：桌面外壳（`dsh-app://app`）免凭据；浏览器里改设置需要在口令框填一次口令
+（前端用它派生 token 并在本页记住）。公网经隧道的请求仍然必须持凭据。
+
+**界面一直提示「口令为空」「自动管理 dsh 会话未生效…请先填一个访问口令」，但口令明明已设**
+
+同属 0.3.3 及以前的 bug：状态快照把 `hasPassword` 放在顶层，而前端读的是
+`config.hasPassword` → 拿到 `undefined` → 恒判定「没有口令」。
+0.3.4 起两处都带（`snapshot.hasPassword` 与 `snapshot.config.hasPassword`），
+仍然只暴露布尔值、不回传口令原值。
 
 **设置里完全没有这个插件**
 1. `plugin_manager list_plugins` 里 `include:dsh-public-relay` 的 `fiberPhase` 是否为 `active`

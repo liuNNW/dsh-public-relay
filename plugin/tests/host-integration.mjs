@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
+import { makeAuth } from '../dsh-public-relay/lib/auth.js';
 
 // ── 整体超时保险 ──
 // 若测试因句柄挂起而无法推进，Node 会在无活动句柄时静默退出、退出码停在默认 0，
@@ -427,6 +428,96 @@ async function main() {
     });
     check('Electron Origin 下 /config 也放行', cfgElectron.status === 200,
       `got ${cfgElectron.status} ${cfgElectron.body.slice(0, 120)}`);
+
+    // ═══ 0.3.4 回归锁：桌面外壳**没有** bearer 时也必须能改设置 ═══
+    //
+    // 为什么单开一段：上面所有 Electron 用例都带了 `adminAs`（bearer），
+    // 而真实前端 client.js 的 `call()` **从来不发 Authorization** ——
+    // 于是「测试全绿、线上永远 403」，用户看到的就是「停用点了没反应」。
+    // 下面几条故意不带任何凭据，复刻真实前端的调用形状。
+    {
+      const shellCtrl = await callRoute(host, 'POST', '/dsh-public-relay/control', {
+        headers: { origin: 'dsh-app://app', host: `127.0.0.1:${host.port}` },
+        body: { action: 'status' },
+      });
+      check('桌面外壳 Origin 无凭据 → /control 200（真实前端路径）', shellCtrl.status === 200,
+        `got ${shellCtrl.status} ${shellCtrl.body.slice(0, 160)}`);
+
+      const shellCfg = await callRoute(host, 'POST', '/dsh-public-relay/config', {
+        headers: { origin: 'dsh-app://app', host: `127.0.0.1:${host.port}` },
+        body: { config: { forceLoopback: true } },
+      });
+      check('桌面外壳 Origin 无凭据 → /config 200（真实前端路径）', shellCfg.status === 200,
+        `got ${shellCfg.status} ${shellCfg.body.slice(0, 160)}`);
+
+      // 「停用中转」按钮走的就是 toggle
+      const shellToggle = await callRoute(host, 'POST', '/dsh-public-relay/control', {
+        headers: { origin: 'dsh-app://app', host: `127.0.0.1:${host.port}` },
+        body: { action: 'toggle' },
+      });
+      check('桌面外壳 Origin 无凭据 → 能停用中转（toggle 200）', shellToggle.status === 200,
+        `got ${shellToggle.status} ${shellToggle.body.slice(0, 160)}`);
+
+      const shellToggleBack = await callRoute(host, 'POST', '/dsh-public-relay/control', {
+        headers: { origin: 'dsh-app://app', host: `127.0.0.1:${host.port}` },
+        body: { action: 'toggle' },
+      });
+      check('再 toggle 一次恢复运行', shellToggleBack.status === 200,
+        `got ${shellToggleBack.status} ${shellToggleBack.body.slice(0, 160)}`);
+
+      // 豁免只认精确的 dsh-app://app，不是任意 dsh-app:// 前缀
+      const forgedShell = await callRoute(host, 'POST', '/dsh-public-relay/control', {
+        headers: { origin: 'dsh-app://evil', host: `127.0.0.1:${host.port}` },
+        body: { action: 'status' },
+      });
+      check('伪造 dsh-app://evil 且无凭据 → 403', forgedShell.status === 403,
+        `got ${forgedShell.status}`);
+
+      // 安全边界不放宽：普通 http 同源且无凭据仍然拒绝
+      const plainNoCred = await callRoute(host, 'POST', '/dsh-public-relay/control', {
+        headers: { origin: `http://127.0.0.1:${dshPort}` },
+        body: { action: 'status' },
+      });
+      check('http 同源无凭据 → 仍 403（豁免只给桌面外壳）', plainNoCred.status === 403,
+        `got ${plainNoCred.status}`);
+    }
+
+    // ═══ 0.3.4 回归锁：hasPassword 必须出现在 config 内 ═══
+    //
+    // 前端 draftFrom() 读的是 `config.hasPassword`；此前 snapshot 只把它放在
+    // 顶层，于是 UI 恒认定「口令为空」，界面一直挂着「请先填一个访问口令」。
+    {
+      const res = await callRoute(host, 'GET', '/dsh-public-relay/status');
+      const snap = JSON.parse(res.body || '{}');
+      check('snapshot 顶层 hasPassword === true', snap.hasPassword === true,
+        JSON.stringify(snap).slice(0, 200));
+      check('snapshot config.hasPassword === true（前端读的是这里）',
+        snap.config !== undefined && snap.config.hasPassword === true,
+        JSON.stringify(snap.config || {}).slice(0, 200));
+      check('snapshot 不含口令原值', !res.body.includes(PW), '口令被写进了状态快照');
+    }
+
+    // ═══ 前端派生算法契约：WebCrypto 版必须与 makeAuth 一致 ═══
+    //
+    // client.js 是 classic script，无法 import 宿主模块，只能内联同一套派生。
+    // 任一侧改动而另一侧没同步 → 一律 403，且症状极难定位。锁死这条契约。
+    {
+      const subtle = crypto.webcrypto.subtle;
+      const enc = new TextEncoder();
+      const hmacKey = await subtle.importKey('raw', enc.encode('dsh-public-relay'),
+        { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+      const secret = await subtle.sign('HMAC', hmacKey, enc.encode(PW));
+      const payload = Buffer.from(JSON.stringify({ exp: Date.now() + 60000 })).toString('base64url');
+      const msgKey = await subtle.importKey('raw', new Uint8Array(secret),
+        { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+      const sig = Buffer.from(new Uint8Array(await subtle.sign('HMAC', msgKey, enc.encode(payload))))
+        .toString('base64url');
+      const token = `${payload}.${sig}`;
+      const auth = makeAuth(PW);
+      check('WebCrypto 派生的 token 能被后端 makeAuth 接受',
+        auth !== null && auth.verifyToken(token) === true,
+        '前端与后端的 token 派生算法已漂移');
+    }
 
     // 403 响应体不回显 origin/host 原值（头值是攻击者可控的，回显即反射预言机）
     check('403 响应体不含 origin 原值', !/evil\.example\.com/.test(crossOrigin.body),

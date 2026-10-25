@@ -112,7 +112,35 @@ function isTrustedWrite(request) {
 function isAuthorizedAdmin(request, password) {
   const auth = makeAuth(password);
   if (auth !== null && isAdminRequest(request, auth)) return true;
-  return auth === null && isLoopbackPeer(request);
+  if (auth === null && isLoopbackPeer(request)) return true;
+  /*
+   * 桌面外壳的自渲染界面：Origin **精确等于** dsh-app://app，且对端是回环。
+   *
+   * ── 为什么必须豁免（0.3.4 修的 403）──
+   *
+   * 设置页的每个按钮都走这条路由，而它的 `fetch` **拿不到口令** —— 口令是
+   * write-only、从不回填，前端也就无从派生 bearer。0.2.3 加 `isAdminRequest`
+   * 时没有同步给前端补上凭据，于是口令一旦设置，设置页就**永远 403**：
+   * 界面上表现成「保存/停用点了没反应」（前端把非 2xx 折成 `HTTP 403`）。
+   *
+   * 测试没抓住它，是因为所有管理路由用例都额外带了 `adminAs: PW`
+   * （即替前端补了一个真实前端从未发送的 bearer）。
+   *
+   * ── 为什么这样豁免是安全的 ──
+   *
+   *   · `dsh-app://app` 是 Electron 注册的私有 scheme，只有桌面外壳页面能
+   *     产生这个 Origin。网页**无法**跨源伪造它 —— 浏览器发出的 Origin 由
+   *     浏览器按页面来源写入，不是请求方可设置的字符串。
+   *   · 仍要求对端回环：即便将来出现能伪造该 Origin 的非浏览器客户端，
+   *     非本机来源也进不来。
+   *   · 与 `isTrustedWrite` 的判据一致（那里同样精确匹配这个 Origin）。
+   *   · 公网面不在豁免内：经中转进来的请求，Origin 已被 `rewriteHeaders`
+   *     改写成 `http://<target>`，永远不等于 `dsh-app://app`；
+   *     DNS rebinding 也不行 —— 攻击者页面的 Origin 是它自己的域名。
+   *     所以「公网仍必须持凭据」这条没有放宽。
+   */
+  if (request.headers.origin === DSH_APP_ORIGIN && isLoopbackPeer(request)) return true;
+  return false;
 }
 
 /** 带体积上限的 JSON body 读取。 */
@@ -358,12 +386,24 @@ export function apply(ctx, entryConfig) {
     const session = sessionSigner.status();
     // 脱敏：只保留「有没有设口令」，不提供任何形式的还原
     const { password: _password, ...publicConfig } = config;
+    /*
+     * `hasPassword` 必须**同时**出现在 config 内与顶层。
+     *
+     * 历史 bug（0.3.4 修）：此前只放在顶层，而前端 `draftFrom()` 读的是
+     * `config.hasPassword` —— 拿到 undefined → 认定「没有口令」→
+     * 界面恒显示「⚠ 当前没有口令」与「自动管理 dsh 会话未生效……请先填一个
+     * 访问口令」，哪怕口令其实已设。顶层那份是给 `snap.hasPassword`
+     * （告警条）用的，两处都不能少。
+     *
+     * 仍然只暴露布尔：口令原值绝不进入快照。
+     */
+    const hasPassword = Boolean(config.password);
     return {
       ...status,
       dshPort: dsh.port,
       dshAddress: status.dsh?.address ?? null,
-      config: publicConfig,
-      hasPassword: Boolean(config.password),
+      config: { ...publicConfig, hasPassword },
+      hasPassword,
       defaults: (() => {
         const { password: _dp, ...rest } = DEFAULTS;
         return rest;

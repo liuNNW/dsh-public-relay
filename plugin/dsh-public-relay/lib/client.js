@@ -112,6 +112,7 @@ window.__ModuleLoader__.load({
       saveOk: '已保存 ✓（监听参数变更会自动重启中转）',
       saveRecoverable: '已保存，但写入配置文件失败 —— 本次修改只在当前进程内生效。',
       saveFail: '保存失败',
+      needPasswordToSave: '需要先填写访问口令：改配置/启停要求持有口令（它由口令派生，前端不保存口令本身）。填好后点保存即可；已填过则本页内会记住。',
       portInvalid: '请填 0–65535 的整数。',
       dirty: '有未保存的修改',
       configFile: '配置文件',
@@ -179,6 +180,7 @@ window.__ModuleLoader__.load({
       saveRecoverable: 'Saved, but writing the config file failed — this change only applies to the running process.',
       saveFail: 'Save failed',
       portInvalid: 'Enter an integer from 0 to 65535.',
+      needPasswordToSave: 'Passcode required: changing settings or starting/stopping needs proof of the passcode (derived from it; the passcode itself is never stored). Type it and save again — it is remembered for this page.',
       dirty: 'Unsaved changes',
       configFile: 'Config file',
       patched: 'Patched bundles',
@@ -273,13 +275,88 @@ window.__ModuleLoader__.load({
       }
     }
 
-    async function call(route, payload) {
+    /* ─────────── 管理 token（bearer）派生 ───────────
+     *
+     * 为什么需要：`/config` 与 `/control` 是**写**接口，宿主半要求
+     * 「持有中转口令」才放行（`isAdminRequest`）。而口令是 write-only、
+     * 从不回填，所以前端唯一的来源就是用户此刻敲进输入框的那个值。
+     *
+     * 算法必须与 lib/auth.js 的 makeAuth **逐字节一致**：
+     *
+     *   secret  = HMAC-SHA256(key="dsh-public-relay", msg=password)
+     *   payload = base64url(JSON.stringify({ exp }))
+     *   sig     = base64url(HMAC-SHA256(key=secret, msg=payload))
+     *   token   = `${payload}.${sig}`
+     *
+     * 任一处不同都会静默变成 403，所以两边改动时必须同步。
+     * 桌面外壳（dsh-app://app）不走这条路 —— 宿主半对它豁免，
+     * 因为外壳页面拿不到口令，见 index.js 的 isAuthorizedAdmin。
+     */
+
+    /** 字节 → base64url（无填充）。 */
+    function toBase64Url(bytes) {
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary).split('+').join('-').split('/').join('_').replace(/=+$/, '');
+    }
+
+    /** 本页内缓存的管理 token：密码框为空时复用它，避免每次点按钮都重敲口令。 */
+    let adminTokenCache = null;
+
+    /**
+     * 用口令派生管理 token。
+     * @returns token 字符串；口令为空或环境不支持 WebCrypto 时返回 null。
+     */
+    async function deriveAdminToken(password) {
+      if (typeof password !== 'string' || password === '') return null;
+      try {
+        const subtle = globalThis.crypto && globalThis.crypto.subtle;
+        if (!subtle) return null;
+        const enc = new TextEncoder();
+        const hmacKey = await subtle.importKey(
+          'raw', enc.encode('dsh-public-relay'),
+          { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+        );
+        const secret = await subtle.sign('HMAC', hmacKey, enc.encode(password));
+        const exp = Date.now() + 7 * 24 * 60 * 60 * 1000;
+        const payload = toBase64Url(enc.encode(JSON.stringify({ exp })));
+        const msgKey = await subtle.importKey(
+          'raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+        );
+        const sig = await subtle.sign('HMAC', msgKey, enc.encode(payload));
+        return `${payload}.${toBase64Url(new Uint8Array(sig))}`;
+      } catch {
+        return null;
+      }
+    }
+
+    /** 取本次调用要用的 token：优先用新敲的口令，否则用本页缓存。 */
+    async function resolveAdminToken(password) {
+      if (typeof password === 'string' && password !== '') {
+        const fresh = await deriveAdminToken(password);
+        if (fresh !== null) adminTokenCache = fresh;
+        return fresh;
+      }
+      return adminTokenCache;
+    }
+
+    async function call(route, payload, token) {
+      const headers = { 'content-type': 'application/json' };
+      if (typeof token === 'string' && token !== '') headers.authorization = `Bearer ${token}`;
       const response = await fetch(apiUrl(route), {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers,
         body: JSON.stringify(payload ?? {}),
       });
-      if (!response.ok) return { ok: false, error: `HTTP ${response.status}` };
+      if (!response.ok) {
+        /*
+         * 403 的两种成因要分开说：口令不对、或压根没带口令。
+         * 直接把 `HTTP 403` 抛给用户等于什么都没解释 —— 而那正是
+         * 「点了没反应」这类投诉的来源。
+         */
+        if (response.status === 403) return { ok: false, error: 'forbidden', status: 403 };
+        return { ok: false, error: `HTTP ${response.status}` };
+      }
       let parsed = null;
       try {
         parsed = await response.json();
@@ -291,8 +368,9 @@ window.__ModuleLoader__.load({
     }
 
     const readStatus = () => call('status');
-    const sendControl = (action) => call('control', { action });
-    const saveConfig = (config) => call('config', { config });
+    /** @param password - 用户在口令框里新敲的值（可为空，空时用本页缓存）。 */
+    const sendControl = async (action, password) => call('control', { action }, await resolveAdminToken(password));
+    const saveConfig = async (config, password) => call('config', { config }, await resolveAdminToken(password));
 
     async function copyText(text) {
       try {
@@ -335,6 +413,12 @@ window.__ModuleLoader__.load({
       if (!lastError) return null;
       if (lastError === 'port-in-use') return `${t('portInUse')}：换一个「中转监听端口」，或先停掉占用者，然后重新启用。`;
       if (String(lastError).startsWith('listen-failed')) return `无法绑定中转监听地址（${lastError}）：检查地址权限与端口范围。`;
+      /*
+       * 写接口 403 的唯一成因是「没拿到持口令凭据」：
+       * 口令框为空且本页还没成功派生过 token（桌面外壳不会走到这里，
+       * 宿主半对它豁免）。说清该怎么办，别把 HTTP 状态码丢给用户。
+       */
+      if (lastError === 'forbidden') return t('needPasswordToSave');
       return String(lastError);
     }
 
@@ -449,7 +533,7 @@ window.__ModuleLoader__.load({
         setBusy('toggle');
         setNote({ kind: '', text: '' });
         try {
-          const res = await sendControl('toggle');
+          const res = await sendControl('toggle', draft ? draft.password : '');
           if (!mounted.current) return;
           if (res && res.status) setSnap(res.status);
           if (res && res.ok !== true && res.error) {
@@ -477,7 +561,7 @@ window.__ModuleLoader__.load({
             forceLoopback: draft.forceLoopback,
             autoSession: draft.autoSession,
             compressWebSocket: draft.compressWebSocket,
-          });
+          }, passwordChanged ? draft.password : '');
           if (!mounted.current) return;
           if (res && res.ok === true) {
             if (res.status) {

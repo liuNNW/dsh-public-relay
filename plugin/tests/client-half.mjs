@@ -722,6 +722,26 @@ async function main() {
     check('重复 apply 后只保留一个活样式标签', liveTags.length === 1, `got ${liveTags.length}`);
   }
 
+  // ── 写接口必须带凭据（0.3.4 回归）──
+  //
+  // 真实事故：前端 `call()` 只发 content-type，从未发 Authorization，
+  // 而宿主半在「口令已设」时要求持凭据 → 设置页保存/停用**永远 403**。
+  // 宿主半那边已有不带 bearer 的端到端用例；这里在客户端侧再钉一道，
+  // 防止将来重构时把凭据悄悄丢掉（那种改法在服务端测试里看不出来）。
+  section('写接口凭据（0.3.4）');
+  {
+    const src = clientSource;
+    check('client.js 会发送 Authorization 头', /authorization\s*[:=]/i.test(src),
+      '找不到 authorization 写入点');
+    check('client.js 使用 Bearer 方案', src.includes('Bearer '), '找不到 Bearer 前缀');
+    check('client.js 含 token 派生（HMAC + dsh-public-relay 盐）',
+      src.includes('dsh-public-relay') && /HMAC/i.test(src),
+      '找不到与宿主半一致的密钥派生');
+    check('client.js 对 403 给出可读提示而非裸 HTTP 状态码',
+      src.includes('needPasswordToSave') && !/return \{ ok: false, error: `HTTP \$\{response\.status\}` \};/.test(src.split("'forbidden'")[0].split('\n').slice(-3).join('\n')),
+      '403 仍被折成 HTTP 403 裸文案');
+  }
+
   console.log(`\n${'═'.repeat(56)}`);
   if (failures.length === 0) {
     console.log(`浏览器半测试全部通过：${passed} 项断言 ✅`);
