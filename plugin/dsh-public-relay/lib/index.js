@@ -31,7 +31,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-import { createRelay } from './relay.js';
+import { createRelay, RELAY_HOP_HEADER } from './relay.js';
 import { createSessionSigner } from './dsh-cookie.js';
 import { isAdminRequest, isLoopbackPeer, makeAuth } from './auth.js';
 import {
@@ -507,6 +507,16 @@ export function apply(ctx, entryConfig) {
       }
       const route = pathname.slice(ROUTE_PREFIX.length) || '/';
 
+      /*
+       * 这条请求是不是**经中转**转发进来的。
+       *
+       * 中转会给每个转发请求打上 RELAY_HOP_HEADER，本机直连不会有。
+       * dsh 的其余判据（Host/Origin/对端地址）在两种情况下完全一样，
+       * 只有这个标记能区分 —— 而「当前页面是否走中转」直接决定
+       * 「停用中转会不会把用户自己的页面断掉」，必须如实告知前端。
+       */
+      const viaRelay = request.headers[RELAY_HOP_HEADER] !== undefined;
+
       try {
         // 只读：状态快照。GET 便于直接访问排查，POST 兼容统一调用方式。
         if (route === '/status' || route === '/') {
@@ -515,7 +525,7 @@ export function apply(ctx, entryConfig) {
             response.end();
             return;
           }
-          return sendJson(response, 200, { ok: true, ...snapshot() });
+          return sendJson(response, 200, { ok: true, ...snapshot(), viaRelay });
         }
 
         // 写：启停
@@ -531,7 +541,46 @@ export function apply(ctx, entryConfig) {
             return sendJson(response, 403, { ok: false, error: 'forbidden' });
           }
           const body = await readJsonBody(request);
-          const result = await control(typeof body.action === 'string' ? body.action : 'status');
+          const action = typeof body.action === 'string' ? body.action : 'status';
+
+          /*
+           * 「停止」类动作必须**先回响应，再停中转**（0.3.5）。
+           *
+           * 为什么：relay.stop() 一开头就 `closeAllConnections()` + 逐个
+           * socket.destroy()（见 relay.js 的 doStop）。如果这条请求本身是
+           * **经中转转发进来的**（用户就是通过隧道地址打开的设置页），
+           * 那么承载它的连接会被自己掐断 —— 响应永远到不了浏览器：
+           * 前端只看到网络错误（「提示一个报错」），页面随即失去传输
+           * （「设置里看不到任何内容了」），而且没法自己恢复。
+           *
+           * 先发送、等 `finish`（响应已写进内核缓冲）再停，用户至少能收到
+           * 「已停用」的明确结果；同时前端会提示这次操作会断开当前页面。
+           */
+          const willStop = action === 'stop'
+            || (action === 'toggle' && relay.status().state === 'running');
+          if (willStop) {
+            /*
+             * 用「预测的停用后快照」作答：此刻还没真停，relay.status() 仍是
+             * running，直接返回会让 UI 以为没停。停用后这些字段的取值是确定的
+             * （state/uptime/startedAt），其余（listen、config…）保持不变。
+             * 下一轮轮询会用真实快照覆盖，预测错了也能自愈。
+             */
+            const predicted = {
+              ...snapshot(), state: 'stopped', uptimeMs: 0, startedAt: null, viaRelay,
+            };
+            sendJson(response, 200, { ok: true, status: predicted, error: null });
+            response.once('finish', () => {
+              setImmediate(() => {
+                void control(action).catch((error) => {
+                  log('warn', `停用中转失败：${error?.message || error}`);
+                });
+              });
+            });
+            return;
+          }
+
+          const result = await control(action);
+          if (result.status) result.status.viaRelay = viaRelay;
           return sendJson(response, result.ok ? 200 : 502, result);
         }
 
@@ -547,7 +596,9 @@ export function apply(ctx, entryConfig) {
           }
           const body = await readJsonBody(request);
           const patch = body.config && typeof body.config === 'object' ? body.config : {};
-          return sendJson(response, 200, await writeConfig(patch));
+          const saved = await writeConfig(patch);
+          if (saved.status) saved.status.viaRelay = viaRelay;
+          return sendJson(response, 200, saved);
         }
 
         // 未知子路由：不回显 route 原值。

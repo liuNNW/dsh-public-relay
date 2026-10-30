@@ -9,7 +9,7 @@
 | **DSH 插件**（推荐） | 日常使用。跑在 dsh 进程内，设置页里看端口、随时开关 | [`plugin/dsh-public-relay`](plugin/dsh-public-relay) |
 | **独立脚本** | 不想装插件、或要用它的 `dsh web` 守护 | [`dsh-public-relay.js`](dsh-public-relay.js) |
 
-- **当前版本**：`0.3.4`
+- **当前版本**：`0.3.5`
 - **npm**：`dsh-public-relay`
 - **仓库**：<https://github.com/liuNNW/dsh-public-relay>
 - **许可证**：MIT
@@ -269,7 +269,7 @@ plugin/
     locale/{zh,en}.json          插件列表展示元数据
   install.ps1                    自检 / 安装指引 / 旧安装残留清理（须保持 UTF-8 BOM）
   tools/                         诊断、安全审计与开发工具
-  tests/                         七套测试（387 项断言）
+  tests/                         七套测试（407 项断言）
 ```
 
 ---
@@ -279,8 +279,8 @@ plugin/
 ```powershell
 # 七套测试
 node plugin\tests\smoke.mjs              # 中转核心      110 项
-node plugin\tests\host-integration.mjs   # 宿主半         89 项
-node plugin\tests\client-half.mjs        # 浏览器半       66 项
+node plugin\tests\host-integration.mjs   # 宿主半         94 项
+node plugin\tests\client-half.mjs        # 浏览器半       81 项
 node plugin\tests\dsh-session.spec.mjs   # 会话代签       76 项
 node plugin\tests\password-modes.mjs     # 口令模式        6 项
 node plugin\tests\token-exchange.spec.mjs # token 交换验真 25 项
@@ -317,6 +317,7 @@ node plugin\tools\soak-relay-auth.mjs [轮数] [并发]    # 高频采样，捕�
 node plugin\tools\probe-prompt.mjs                   # /api 各端点经中转 vs 直连对比
 node plugin\tools\fix-credentials-version.mjs        # 修 credentials 里的版本字段
 node plugin\tools\probe-admin-403.mjs                # 管理路由 403 判定矩阵 + 快照 hasPassword 核对
+node plugin\tools\repro-toggle-bug.mjs               # 抓一次「停用」的完整响应（含 viaRelay/停止态字段）
 ```
 
 #### ③ 隧道 / 连通性
@@ -527,6 +528,7 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 
 | 版本 | 关键变化 |
 | --- | --- |
+| `0.3.5` | **修复**：点「停用」后报错、设置页整块失效。真因是 `relay.stop()` 一开头就销毁所有 socket，把承载这次请求的连接（用户正是经中转打开的设置页）连同响应一起掐断。改为优雅排空 + 先回响应再停用；并新增 `viaRelay` 让前端知道「你正在通过中转访问」，停用前二次确认。同时面板不再白屏 —— 渲染异常会显示原因与现场信息 |
 | `0.3.4` | **修复**：设置页「保存/停用」必现 `HTTP 403` —— 管理路由要求 bearer，而前端从未发送。桌面外壳（`dsh-app://app`）改为免凭据，前端补上 bearer 派生（浏览器场景用）。同时修 `hasPassword` 位置错误导致的「口令为空」误报 |
 | `0.3.3` | **观测**：记录每一次「上游 401」的完整上下文（方法/路径/注入的 dsh-auth cookie 结构），`status.upstream401` 可查。同时补齐间歇性 401 的排查工具链与 dsh 接受 cookie 的实测边界 |
 | `0.3.2` | **修复**：15s「connect timeout」实为整个请求总时限，会掐断 `session/prompt` 等长耗时调用。拆成两段：连接 15s / 等响应头 5 分钟 / 响应体传输不限时 |
@@ -646,6 +648,40 @@ node plugin\tools\probe-admin-403.mjs
 
 修复后的规则：桌面外壳（`dsh-app://app`）免凭据；浏览器里改设置需要在口令框填一次口令
 （前端用它派生 token 并在本页记住）。公网经隧道的请求仍然必须持凭据。
+
+**点了「停用」之后弹一个报错，然后设置页整块变空 / 完全没内容了**
+
+0.3.4 及以前的结构性问题，**最典型的发生条件是：你正通过中转地址（隧道域名）
+打开着 dsh**。此时点「停用」等于把这个页面自己的传输掐掉：
+
+1. 请求经中转到达 dsh，dsh 开始停用中转；
+2. `relay.stop()` 一开头就 `closeAllConnections()` + 逐个 `socket.destroy()`；
+3. **承载这条「停用」请求的连接就是其中之一** → 响应还没写回浏览器就被销毁；
+4. 前端只看到网络错误（那句「报错」），随后整个页面失去传输（「看不到任何内容」），
+   而且在这个已经失效的页面上没法再把中转打开。
+
+0.3.5 起三层修复：
+
+- **优雅排空**：停用时只立即断开已升级的 WebSocket，普通 HTTP 连接留出排空窗口
+  （2s 兜底），在途响应能写完；
+- **先回响应再停用**：`/control` 的停止类动作先把 200 发出去，`finish` 之后才真正停；
+- **`viaRelay` + 二次确认**：宿主半把「这条请求是否经中转」如实告诉前端
+  （中转给每个转发请求打 `x-dsh-public-relay-hop` 标记头），前端在本页正走中转时
+  先弹警告、要求再点一次才真的停用。
+
+```powershell
+# 现场核对：直连与经中转的 viaRelay 分别是什么
+node plugin\tools\repro-toggle-bug.mjs
+```
+
+**如果已经被断开了怎么恢复**：改用本机地址 `http://127.0.0.1:<dsh端口>` 打开 dsh
+（桌面外壳默认就是这个），在那里停用/启用；或者完全退出并重启 dsh
+（`重启dsh.cmd`），配置里 `enabled: true` 会在启动时自动拉起中转。
+
+**现在不会再白屏了**：面板把渲染期异常捕获成可读文字 + 现场信息
+（`state=` / `viaRelay=` / 异常原文），且明确告诉用户「配置未被改动」。
+若再次出现「设置里没内容」，把那两行贴出来即可定位 —— 而不是又一次只剩
+「什么都没有」。
 
 **界面一直提示「口令为空」「自动管理 dsh 会话未生效…请先填一个访问口令」，但口令明明已设**
 

@@ -58,6 +58,23 @@ export { makeAuth, loginKeyOf, isLoopbackPeer, LOGIN_PAGE };
 const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
 
 /**
+ * 中转转发时打上的标记头。
+ *
+ * 用途：让**宿主半**能分辨「这条请求是经中转进来的」还是「本机直连」。
+ * 两者在 dsh 看来一模一样 —— 中转会把 Host/Origin 改写成回环权威，
+ * 对端地址也是 127.0.0.1，靠请求本身无法区分。
+ *
+ * 为什么必须能区分：设置页点「停用」时，如果这个页面本身就在中转端口上，
+ * 停用会立刻掐断它自己的传输（页面随即失配、无法点回来）。宿主半据此
+ * 在 status 里回 `viaRelay`，前端就能先警告并要二次确认。
+ *
+ * 不可被外部伪造利用：中转对所有转发请求都无条件覆盖写入该头，
+ * 客户端无法通过伪造它来"冒充本机"（作用方向是相反的 —— 带这个头只会
+ * 被判定为"经中转"，属于更严格的一侧）。
+ */
+export const RELAY_HOP_HEADER = 'x-dsh-public-relay-hop';
+
+/**
  * 上游**连接**阶段兜底超时（DNS + TCP + 等 socket 就绪）。
  *
  * 只覆盖「能不能连上」，**不覆盖**「上游什么时候回响应」——
@@ -1030,6 +1047,13 @@ export function createRelay(options = {}) {
    */
   function prepareForwardHeaders(req, forUpgrade, TARGET, c) {
     const headers = rewriteHeaders(req.headers, forUpgrade, TARGET);
+    /*
+     * 先打「经中转」标记，再走后面的早退分支。
+     * 放在 return 之前是必须的：`autoSession === false` 或口令为空时下面会
+     * 直接 return，若标记写在后面就会漏掉那些请求 —— 而「页面是否走中转」
+     * 与代签是否启用毫无关系。
+     */
+    headers[RELAY_HOP_HEADER] = '1';
     if (!sessionSigner || c.autoSession === false) return headers;
     if (!c.password) return headers;   // 无口令时不代签：等价于无条件送出 dsh 会话
     try {
@@ -1837,6 +1861,18 @@ export function createRelay(options = {}) {
     });
 
     srv.on('upgrade', (req, socket, head) => {
+      /*
+       * 标记「已升级」的 socket。
+       *
+       * 停用时必须区别对待两类连接：
+       *   · 普通 HTTP：可能正承载一个在途响应（例如「停用」这条命令自己的
+       *     响应要经中转回给浏览器）。直接 destroy 会把响应截断 ——
+       *     用户看到的是网络错误 + 页面失联，而不是「已停用」。
+       *   · 已升级的 WebSocket：永远不会自己结束，不主动断开的话
+       *     server.close() 永不返回。
+       * 所以停用时只**立即**销毁后者，前者给一个排空窗口。
+       */
+      socket.__relayUpgraded = true;
       try {
         handleUpgrade(req, socket, head, currentAuth(), cfg());
       } catch (err) {
@@ -1950,16 +1986,32 @@ export function createRelay(options = {}) {
       };
       const timer = setTimeout(finish, STOP_DRAIN_TIMEOUT_MS);
 
+      /*
+       * 优雅排空，而不是立刻掐断（0.3.5）。
+       *
+       * 旧实现在这里直接 closeAllConnections() + 逐个 destroy()。后果：
+       * 如果「停用」这条命令本身是**经中转**进来的（用户就是通过隧道地址
+       * 打开的设置页），承载它的连接会被自己掐断 —— 响应永远回不到浏览器，
+       * 用户只看到报错，页面随即失联，而且在失联的页面上没法再点回来。
+       *
+       * 现在的顺序：
+       *   1. closeIdleConnections()：关掉空闲的 keep-alive，让 close() 能返回；
+       *   2. 立即销毁**已升级**的 WebSocket —— 它们永远不会自己结束；
+       *   3. srv.close() 停止接受新连接，等在途 HTTP 响应写完；
+       *   4. 2 秒兜底定时器仍然兜住任何赖着不走的连接（finish 里统一销毁）。
+       */
       try {
-        srv.closeAllConnections?.();
+        srv.closeIdleConnections?.();
       } catch {
-        /* 忽略 */
+        /* 老版本 Node 无此方法 */
       }
       for (const socket of [...liveSockets]) {
-        try {
-          socket.destroy();
-        } catch {
-          /* 忽略 */
+        if (socket.__relayUpgraded === true) {
+          try {
+            socket.destroy();
+          } catch {
+            /* 已关闭 */
+          }
         }
       }
       srv.close(() => finish());

@@ -60,6 +60,21 @@ function portListening(port) {
 }
 
 /**
+ * 轮询直到条件成立（默认 3s）。
+ *
+ * 0.3.5 起「停用」是**先回响应再真停**，所以端口释放不再与响应同步完成。
+ * 断言端口状态必须轮询，不能紧接着读一次就下结论。
+ */
+async function waitUntil(predicate, timeoutMs = 3000, intervalMs = 50) {
+  const t0 = Date.now();
+  for (;;) {
+    if (await predicate()) return true;
+    if (Date.now() - t0 >= timeoutMs) return false;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
+/**
  * 起一个真实 HTTP server，把请求分发给插件注册的"最长匹配"处理器。
  *
  * 为什么不用伪造的 IncomingMessage/ServerResponse：伪造对象不会自发
@@ -544,7 +559,9 @@ async function main() {
     const stopBody = JSON.parse(stopped.body);
     check('stop 返回 ok', stopBody.ok === true, stopped.body);
     check('stop 后状态为 stopped', stopBody.status.state === 'stopped', `got ${stopBody.status.state}`);
-    check('stop 后端口已释放', await portListening(relayPort) === false, `port ${relayPort} still listening`);
+    check('stop 后端口已释放（先回响应再真停，故轮询等待）',
+      await waitUntil(async () => (await portListening(relayPort)) === false),
+      `port ${relayPort} still listening`);
 
     const started = await callRoute(host, 'POST', '/dsh-public-relay/control', {
       headers: { origin: `http://127.0.0.1:${dshPort}` },
@@ -555,6 +572,49 @@ async function main() {
     check('start 返回 ok', startBody.ok === true, started.body);
     check('start 后端口重新监听', await portListening(relayPort) === true, `port ${relayPort} not listening`);
 
+    // ═══ viaRelay：宿主半必须能分辨「直连」与「经中转」═══
+    //
+    // 两者在 dsh 看来完全一样（Host/Origin 已被改写成回环、对端都是 127.0.0.1），
+    // 只有中转打的 RELAY_HOP_HEADER 能区分。设置页据此决定「停用前是否要先警告」，
+    // 判错会让用户在自己的页面上点停用、然后页面失联。
+    {
+      const direct = await callRoute(host, 'GET', '/dsh-public-relay/status');
+      check('直连 /status 的 viaRelay=false',
+        JSON.parse(direct.body).viaRelay === false, direct.body.slice(0, 140));
+
+      const loginRes = await httpRequest(relayPort, 'POST', '/__login',
+        'application/x-www-form-urlencoded', 'password=integration-pass');
+      const ck = (loginRes.headers['set-cookie'] || [])[0]?.split(';')[0] || '';
+      const relayed = await httpRequest(relayPort, 'GET', '/dsh-public-relay/status',
+        'application/json', undefined, { cookie: ck });
+      check('经中转 /status 的 viaRelay=true',
+        JSON.parse(relayed.body).viaRelay === true, relayed.body.slice(0, 140));
+    }
+
+    // ═══ 0.3.5 回归锁：经中转停用，响应必须先送达 ═══
+    //
+    // 事故：用户通过隧道地址打开设置页，点「停用」→ 只看到报错，之后整块
+    // 设置页失效。原因：doStop() 一开头就 closeAllConnections() + 逐个
+    // socket.destroy()，承载这条请求的连接被**自己**掐断，响应永远到不了
+    // 浏览器；页面随即失去传输，也就没法再点回来。
+    // 修复：先 sendJson，等 response 'finish' 之后才真正停用。
+    {
+      const stopViaRelay = await callViaRelay(relayPort, '/dsh-public-relay/control', 'integration-pass',
+        { action: 'toggle' }, { login: true });
+      check('经中转停用仍能收到响应（200，而非连接被掐断）', stopViaRelay === 200,
+        `got ${stopViaRelay}`);
+      check('经中转停用后端口确实已释放',
+        await waitUntil(async () => (await portListening(relayPort)) === false),
+        `port ${relayPort} still listening`);
+
+      const restart = await callRoute(host, 'POST', '/dsh-public-relay/control', {
+        headers: { origin: `http://127.0.0.1:${dshPort}` },
+        body: { action: 'start' },
+        adminAs: 'integration-pass',
+      });
+      check('经中转停用后仍能从直连页面重新启用', JSON.parse(restart.body).ok === true, restart.body);
+    }
+
     const toggled = await callRoute(host, 'POST', '/dsh-public-relay/control', {
       headers: { origin: `http://127.0.0.1:${dshPort}` },
       body: { action: 'toggle' },
@@ -562,7 +622,9 @@ async function main() {
     });
     const toggleBody = JSON.parse(toggled.body);
     check('toggle 关闭中转', toggleBody.status.state === 'stopped', `got ${toggleBody.status.state}`);
-    check('toggle 后端口已释放', await portListening(relayPort) === false, `port ${relayPort} still listening`);
+    check('toggle 后端口已释放',
+      await waitUntil(async () => (await portListening(relayPort)) === false),
+      `port ${relayPort} still listening`);
   }
 
   section('配置写入（自有 JSON 文件，不依赖 settings 服务）');

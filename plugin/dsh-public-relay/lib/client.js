@@ -113,6 +113,13 @@ window.__ModuleLoader__.load({
       saveRecoverable: '已保存，但写入配置文件失败 —— 本次修改只在当前进程内生效。',
       saveFail: '保存失败',
       needPasswordToSave: '需要先填写访问口令：改配置/启停要求持有口令（它由口令派生，前端不保存口令本身）。填好后点保存即可；已填过则本页内会记住。',
+      viaRelayWarn: '当前页面正通过中转访问（不是一个「旁观的设置页」）：从这里停用中转会立刻断开本页，之后无法在本页重新启用 —— 需要改到 http://127.0.0.1:<dsh端口> 的本机页面里操作，或重新启动 dsh。',
+      confirmStopViaRelay: '再次点击「停用」确认：这会断开你当前这个页面。想避免断开，请改在本机直连页面上停用。',
+      confirmStopRecheck: '已进入确认态：再点一次「停用」才会真正停止中转并断开本页。',
+      stoppedViaRelayNote: '已停用中转。本页仍可用说明它其实是直连 dsh 的。',
+      renderCrashWarn: '面板渲染出错（配置未被改动）：',
+      renderCrashCtx: '现场信息：',
+      renderCrashHint: '把这两行反馈给维护者即可定位。要恢复默认视图：重启 dsh，或改配置文件后重新打开设置页。',
       portInvalid: '请填 0–65535 的整数。',
       dirty: '有未保存的修改',
       configFile: '配置文件',
@@ -181,6 +188,13 @@ window.__ModuleLoader__.load({
       saveFail: 'Save failed',
       portInvalid: 'Enter an integer from 0 to 65535.',
       needPasswordToSave: 'Passcode required: changing settings or starting/stopping needs proof of the passcode (derived from it; the passcode itself is never stored). Type it and save again — it is remembered for this page.',
+      viaRelayWarn: 'This page itself is being served through the relay: disabling the relay here drops this very page, and you cannot re-enable it from the dead page. Stop it from the local http://127.0.0.1:<dsh port> page instead, or restart dsh.',
+      confirmStopViaRelay: 'Click "Disable" again to confirm: this will disconnect the page you are on. To avoid that, disable it from the local page instead.',
+      confirmStopRecheck: 'Confirmation armed: one more click on "Disable" will really stop the relay and drop this page.',
+      stoppedViaRelayNote: 'Relay stopped. This page still works, which means it was talking to dsh directly.',
+      renderCrashWarn: 'Panel failed to render (your config was NOT modified): ',
+      renderCrashCtx: 'Context: ',
+      renderCrashHint: 'Report these two lines to the maintainer. To get the normal view back: restart dsh, or reopen this settings page.',
       dirty: 'Unsaved changes',
       configFile: 'Config file',
       patched: 'Patched bundles',
@@ -458,7 +472,32 @@ window.__ModuleLoader__.load({
       const [draft, setDraft] = useState(null);
       const [busy, setBusy] = useState('');
       const [note, setNote] = useState({ kind: '', text: '' });
+      /** 「本页正走中转，停用会断开自己」的二次确认闸门。 */
+      const [confirmStop, setConfirmStop] = useState(false);
       const mounted = useRef(true);
+
+      /**
+       * 当前页面是不是**经中转**加载的（而不是直连 dsh 端口）。
+       *
+       * 判据以宿主半回的 `viaRelay` 为准：中转给每个转发请求打了标记头，
+       * 宿主半据此如实作答。**不能靠端口猜** —— 经隧道时浏览器看到的端口是
+       * 隧道映射端口（如 16689），与中转监听端口（3091）不同，端口判断会漏。
+       *
+       * 为什么需要这个判断：在中转端口上点「停用」，等于把这个页面自己的
+       * 传输掐掉 —— 页面随即失效，且无法从失效的页面里点回来。
+       */
+      const viaRelay = (() => {
+        if (snap !== null && snap.viaRelay === true) return true;
+        // 兜底：直连本机时页面端口恰好等于中转端口（隧道场景下这条不成立，
+        // 所以只作补充判断，不能单独依赖）。
+        try {
+          const port = snap && snap.listen ? String(snap.listen.port ?? '') : '';
+          const here = String(globalThis.location && globalThis.location.port ? globalThis.location.port : '');
+          return port !== '' && here !== '' && port === here;
+        } catch {
+          return false;
+        }
+      })();
 
       /** 用户原意形式的 autoSession（不能用生效值，见宿主半 normalizeConfig 注释）。 */
       const wantedAutoSession = (config) => (
@@ -530,14 +569,30 @@ window.__ModuleLoader__.load({
       const portBad = portText !== '' && (!/^\d+$/.test(portText) || Number(portText) > 65535);
 
       const onToggle = async () => {
+        /*
+         * 本页正走中转时，「停用」会立刻掐断这个页面自己的传输 ——
+         * 用户只会看到报错然后页面失效，且无法从这里再点回来。
+         * 所以先要一次明确确认（第二次点击才真的执行）。
+         */
+        const isStop = snap !== null && snap.state === 'running';
+        if (isStop && viaRelay && !confirmStop) {
+          setConfirmStop(true);
+          setNote({ kind: 'error', text: t('confirmStopViaRelay') });
+          return;
+        }
         setBusy('toggle');
         setNote({ kind: '', text: '' });
+        setConfirmStop(false);
         try {
           const res = await sendControl('toggle', draft ? draft.password : '');
           if (!mounted.current) return;
           if (res && res.status) setSnap(res.status);
           if (res && res.ok !== true && res.error) {
             setNote({ kind: 'error', text: errorText(t, res.error) || String(res.error) });
+          } else if (isStop && viaRelay) {
+            // 成功停用但页面还活着（极少数情况，例如本页其实是直连）：
+            // 说明断开没有发生，给出恢复指引。
+            setNote({ kind: 'ok', text: t('stoppedViaRelayNote') });
           }
         } catch (err) {
           if (mounted.current) setNote({ kind: 'error', text: String((err && err.message) || err) });
@@ -599,6 +654,15 @@ window.__ModuleLoader__.load({
 
       /* ---- 状态区 ---- */
       const body = [];
+      /*
+       * 兜底：渲染期任何异常都不要让整块面板变成空白。
+       *
+       * 「点停用后设置里看不到任何内容」这类反馈之所以难以定位，正是因为
+       * 渲染抛错后整块直接消失、一个字都不留。这里把异常捕获下来，用可读
+       * 文字替代白屏，并带上当时的状态与「是否经中转」—— 让下次复发时
+       * 现场自带证据，而不是又一次只剩「什么都没有」。
+       */
+      try {
       body.push(h('p', { key: 'intro', className: 'dsr-intro' }, t('intro')));
 
       if (snap === null) {
@@ -676,6 +740,16 @@ window.__ModuleLoader__.load({
 
         const err = errorText(t, snap.lastError);
         if (err) body.push(h('div', { key: 'err', className: 'dsr-warn' }, `⚠ ${err}`));
+        /*
+         * 本页正走中转时先说清代价：从这里点「停用」会立即断开本页，
+         * 而且断掉之后没法在同一个页面上点回来。这不是错误，是拓扑事实。
+         */
+        if (viaRelay && snap.state === 'running') {
+          body.push(h('div', { key: 'viaRelay', className: 'dsr-warn' }, `⚠ ${t('viaRelayWarn')}`));
+        }
+        if (confirmStop) {
+          body.push(h('div', { key: 'confirmStop', className: 'dsr-warn' }, `⚠ ${t('confirmStopRecheck')}`));
+        }
         if (!snap.hasPassword) body.push(h('div', { key: 'warn', className: 'dsr-warn' }, `⚠ ${t('passwordEmptyWarn')}`));
         // 开了压缩但 ws 加载失败：这是静默降级，必须让用户知道
         if (snap.websocket && snap.websocket.compressEnabled === true
@@ -801,6 +875,16 @@ window.__ModuleLoader__.load({
           className: `dsr-note${note.kind === 'error' ? ' dsr-err' : note.kind === 'ok' ? ' dsr-ok' : ''}`,
           role: 'status',
         }, note.text));
+      }
+
+      } catch (renderError) {
+        const detail = String((renderError && renderError.message) || renderError);
+        const state = snap && snap.state ? String(snap.state) : 'null';
+        body.push(h('div', { key: 'renderCrash', className: 'dsr-warn' },
+          `⚠ ${t('renderCrashWarn')}${detail}`));
+        body.push(h('p', { key: 'renderCrashCtx', className: 'dsr-text' },
+          `${t('renderCrashCtx')}state=${state}｜viaRelay=${viaRelay ? '1' : '0'}｜snap=${snap === null ? 'null' : 'object'}`));
+        body.push(h('p', { key: 'renderCrashHint', className: 'dsr-text' }, t('renderCrashHint')));
       }
 
       const children = mode === 'section'

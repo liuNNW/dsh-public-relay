@@ -481,6 +481,9 @@ async function main() {
       enabled: true, listenHost: '127.0.0.1', listenPort: 3091,
       password: 'pw', forceLoopback: true, targetHost: null, targetPort: null,
       autoSession: true, autoSessionWanted: true, autoSessionBlocked: false,
+      // 真实快照里 config 内也带 hasPassword（0.3.4）；夹具必须照抄，
+      // 否则「口令为空」的误报在测试里根本暴露不出来。
+      hasPassword: true,
     },
     session: {
       ready: true, hasSecret: true, lastError: null,
@@ -539,6 +542,114 @@ async function main() {
   check('设置页有停用按钮（因正在运行）', settingsText.includes('停用中转'), settingsText.slice(0, 400));
   check('设置页有「保存」按钮（自带表单）', settingsText.includes('保存'), settingsText.slice(-400));
   check('设置页展示了请求数与连接数', settingsText.includes('42') && settingsText.includes('3'), settingsText.slice(0, 400));
+
+  // ── 渲染：停止态（停用之后不应白屏）──
+  //
+  // 真实事故：点「停用」后设置页整块变空、并弹一个报错。
+  // 服务端复核是无辜的（toggle 200、停止态快照字段齐全、/status 仍 200），
+  // 所以问题只可能在「用停止态快照渲染面板」这一步。
+  section('渲染：停止态（停用后不白屏）');
+  {
+    const stoppedStatus = {
+      ...fullStatus,
+      state: 'stopped',
+      uptimeMs: 0,
+      connections: 0,
+      requests: 0,
+      startedAt: null,
+      websocket: {
+        compressEnabled: true, compressionReady: null,
+        openConnections: 0, totalConnections: 0, uplinkBytes: 0, downlinkBytes: 0,
+      },
+    };
+    env.setFetchResponder(async () => ({ ok: true, status: 200, json: async () => stoppedStatus }));
+
+    let renderErr = null;
+    let stoppedRender = null;
+    try {
+      const first = fake.render(settingsReg.component(slotProps));
+      fake.runEffects(first.effects);
+      await new Promise((r) => setTimeout(r, 30));
+      stoppedRender = fake.render(settingsReg.component(slotProps));
+    } catch (err) {
+      renderErr = err;
+    }
+    check('停止态渲染不抛错', renderErr === null, renderErr && (renderErr.stack || renderErr.message));
+
+    const stoppedText = stoppedRender ? textOf(stoppedRender.out).join(' | ') : '';
+    check('停止态显示「已停止」', stoppedText.includes('已停止'), stoppedText.slice(0, 300));
+    check('停止态仍给出「启用中转」按钮', stoppedText.includes('启用中转'), stoppedText.slice(0, 400));
+    check('停止态面板不空白（配置字段仍在）',
+      stoppedText.includes('访问口令') && stoppedText.includes('中转监听端口'),
+      stoppedText.slice(0, 400));
+  }
+
+  // 复原运行态响应，避免影响后续用例
+  env.setFetchResponder(async () => ({ ok: true, status: 200, json: async () => fullStatus }));
+
+  // ── 真实点击「停用」：走完整交互路径 ──
+  //
+  // 上一段只是「用停止态快照重新渲染」。真实事故发生在**点击之后**：
+  // onClick → /control → setSnap(停止态) → 重渲染。这一段把它完整跑一遍，
+  // 任何一步抛错都会暴露出来（而不是被渲染测试掩盖）。
+  section('交互：点击「停用」走完整路径');
+  {
+    /** 在元素树里找第一个满足条件的按钮。 */
+    function findButton(root, needle) {
+      let found = null;
+      const walk = (n) => {
+        if (n === null || n === undefined || typeof n !== 'object') return;
+        if (Array.isArray(n)) { for (const c of n) walk(c); return; }
+        if (!n.__el) return;
+        if (n.type === 'button' && typeof n.props?.onClick === 'function'
+          && textOf(n).join('').includes(needle)) found = n;
+        for (const c of n.children) walk(c);
+      };
+      walk(root);
+      return found;
+    }
+
+    env.setFetchResponder(async () => ({ ok: true, status: 200, json: async () => fullStatus }));
+    let rr = fake.render(settingsReg.component(slotProps));
+    fake.runEffects(rr.effects);
+    await new Promise((r) => setTimeout(r, 30));
+    rr = fake.render(settingsReg.component(slotProps));
+
+    const toggleBtn = findButton(rr.out, '停用中转');
+    check('找到「停用中转」按钮', toggleBtn !== null, textOf(rr.out).join(' | ').slice(0, 300));
+
+    // /control 返回停止态快照（与真实宿主一致）
+    const stoppedSnap = {
+      ...fullStatus, state: 'stopped', uptimeMs: 0, startedAt: null,
+    };
+    env.setFetchResponder(async (url) => {
+      if (String(url).includes('/dsh-public-relay/control')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true, status: stoppedSnap, error: null }) };
+      }
+      return { ok: true, status: 200, json: async () => fullStatus };
+    });
+
+    let clickErr = null;
+    if (toggleBtn !== null) {
+      try { await toggleBtn.props.onClick(); } catch (err) { clickErr = err; }
+    }
+    check('点击停用不抛异常', clickErr === null, clickErr && (clickErr.stack || clickErr.message));
+    await new Promise((r) => setTimeout(r, 40));
+
+    let after = null;
+    let afterErr = null;
+    try { after = fake.render(settingsReg.component(slotProps)); } catch (err) { afterErr = err; }
+    check('停用后重渲染不抛异常', afterErr === null, afterErr && (afterErr.stack || afterErr.message));
+    const afterText = after ? textOf(after.out).join(' | ') : '';
+    check('停用后显示「已停止」', afterText.includes('已停止'), afterText.slice(0, 400));
+    check('停用后面板不空白', afterText.includes('访问口令'), afterText.slice(0, 400));
+    check('停用后没有报错提示', !/HTTP \d|读取失败|保存失败/.test(afterText), afterText.slice(-400));
+    check('停用后请求确实发到了 /control',
+      env.fetchCalls.some((c) => String(c.url).endsWith('/dsh-public-relay/control')),
+      JSON.stringify(env.fetchCalls.map((c) => c.url)));
+
+    env.setFetchResponder(async () => ({ ok: true, status: 200, json: async () => fullStatus }));
+  }
 
   // ── plugins.row.config 配置页（插件行的「配置」入口）──
   section('插件行配置页（plugins.row.config）');
@@ -720,6 +831,42 @@ async function main() {
     // CSS 一定会生效；替身里旧标签被 remove 后数组会累积，所以只断言「当前只有 1 个活标签」。
     const liveTags = env2.styleTags.filter((t) => t.removed !== true);
     check('重复 apply 后只保留一个活样式标签', liveTags.length === 1, `got ${liveTags.length}`);
+  }
+
+  // ── 渲染兜底：异常也不许白屏 ──
+  //
+  // 「点停用后设置里看不到任何内容」之所以难查，是因为渲染抛错后整块消失、
+  // 一个字都不留。面板现在把异常捕获成可读文字 + 现场信息，这条用例锁住它。
+  section('渲染兜底：出错时显示原因而不是空白');
+  {
+    const poison = { ...fullStatus };
+    // patchedScripts 在状态区会被读到；让它抛错即可触发兜底分支
+    Object.defineProperty(poison, 'patchedScripts', {
+      configurable: true,
+      get() { throw new Error('render-boom'); },
+    });
+    env.setFetchResponder(async () => ({ ok: true, status: 200, json: async () => poison }));
+
+    let crashRender = null;
+    let crashErr = null;
+    try {
+      const first = fake.render(settingsReg.component(slotProps));
+      fake.runEffects(first.effects);
+      await new Promise((r) => setTimeout(r, 30));
+      crashRender = fake.render(settingsReg.component(slotProps));
+    } catch (err) {
+      crashErr = err;
+    }
+    check('渲染异常不会逃出组件', crashErr === null, crashErr && (crashErr.stack || crashErr.message));
+
+    const crashText = crashRender ? textOf(crashRender.out).join(' | ') : '';
+    check('出错时显示「面板渲染出错」而不是空白',
+      crashText.includes('面板渲染出错'), crashText.slice(0, 300));
+    check('出错时带出异常原文', crashText.includes('render-boom'), crashText.slice(0, 400));
+    check('出错时带出 state / viaRelay 现场信息',
+      crashText.includes('state=') && crashText.includes('viaRelay='), crashText.slice(0, 500));
+
+    env.setFetchResponder(async () => ({ ok: true, status: 200, json: async () => fullStatus }));
   }
 
   // ── 写接口必须带凭据（0.3.4 回归）──
