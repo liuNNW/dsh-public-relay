@@ -60,6 +60,49 @@ dsh plugin --profile desktop add dsh-public-relay
 
 配置项与排障见 [`plugin/dsh-public-relay/README.md`](plugin/dsh-public-relay/README.md)。
 
+### 局域网直连（手机 / 平板，不用隧道）
+
+**默认只监听 `127.0.0.1`，所以手机一定连不上** —— 这不是防火墙问题，
+而是根本没有在那个网卡上监听。要手机访问必须把「中转监听地址」改成 `0.0.0.0`：
+
+```
+设置 → DSH 中转 → 中转监听地址：0.0.0.0
+```
+
+或直接改配置（改完需要让插件重新应用，走下面这条命令最省事）：
+
+```powershell
+# 改监听地址 + 落盘 + 让中转按新地址重启（一条命令完成）
+node plugin\tools\set-listen-host.mjs 0.0.0.0
+```
+
+然后手机浏览器打开：
+
+```
+http://<电脑的局域网IP>:3091/
+```
+
+查电脑局域网 IP：
+
+```powershell
+Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' }
+```
+
+**注意事项**：
+
+- 手机与电脑必须在**同一网段**（例如都是 `192.168.1.x`）；连的是不同 WiFi 或热点则不通。
+- 部分路由器/AP 开了「AP 隔离 / 客户端隔离」，同网段也互访不了 —— 关掉它。
+- Windows 防火墙若处于**启用**状态，需要放行 TCP 3091（默认只对 Private/Public 档生效，
+  且本项目的默认监听是回环，所以多数机器上不需要动防火墙）：
+  ```powershell
+  New-NetFirewallRule -DisplayName "dsh-public-relay 3091" -Direction Inbound `
+    -Protocol TCP -LocalPort 3091 -RemoteAddress LocalSubnet -Action Allow
+  ```
+- 暴露到局域网后口令就是唯一门槛：**务必非空**。口令为空时管理路由仍只允许回环，
+  但数据面（能进 dsh 界面）对同网段是敞开的。
+- 监听从 `127.0.0.1` 改成 `0.0.0.0` **不会**影响隧道：`0.0.0.0` 覆盖所有网卡，
+  frpc 连 `127.0.0.1:3091` 照旧通。
+
 ### 独立脚本版
 
 ```sh
@@ -317,6 +360,7 @@ node plugin\tools\soak-relay-auth.mjs [轮数] [并发]    # 高频采样，捕�
 node plugin\tools\probe-prompt.mjs                   # /api 各端点经中转 vs 直连对比
 node plugin\tools\fix-credentials-version.mjs        # 修 credentials 里的版本字段
 node plugin\tools\probe-admin-403.mjs                # 管理路由 403 判定矩阵 + 快照 hasPassword 核对
+node plugin\tools\set-listen-host.mjs [host]         # 改中转监听地址并立即生效（局域网访问必用 0.0.0.0）
 node plugin\tools\repro-toggle-bug.mjs               # 抓一次「停用」的完整响应（含 viaRelay/停止态字段）
 ```
 
@@ -541,6 +585,22 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 ---
 
 ## 排障
+
+**手机 / 别的电脑在同一局域网里打不开**
+
+九成是监听地址还是 `127.0.0.1`（只绑回环，外部根本连不上），不是防火墙：
+
+```powershell
+# 看它到底监听在哪
+Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -eq 3091 } | Select-Object LocalAddress
+#   127.0.0.1 → 只能本机访问；0.0.0.0 → 局域网可访问
+
+# 改成 0.0.0.0 并立即生效
+node plugin\tools\set-listen-host.mjs 0.0.0.0
+```
+
+改完用 `http://<电脑局域网IP>:3091/` 访问。仍不通再依次排查：是否同一网段、
+路由器是否开了 AP 隔离、Windows 防火墙是否放行 3091（详见上文「局域网直连」）。
 
 **公网能连但看不到插件列表**
 `force-loopback` 没生效。看插件状态区的「已改写脚本」计数：一直是 0 说明上游没返回
