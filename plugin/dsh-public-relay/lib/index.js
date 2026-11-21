@@ -421,30 +421,52 @@ export function apply(ctx, entryConfig) {
     };
   }
 
-  /** 开关动作统一入口（UI 的启停按钮、HTTP 路由、工具共用）。 */
+  /**
+   * 开关动作统一入口（UI 的启停按钮、HTTP 路由、工具共用）。
+   *
+   * ── 0.3.6：启停改为**持久** ──
+   *
+   * 旧实现只调 `relay.start()/stop()`，**从不写配置**，`enabled` 留在原值。
+   * 而 `reconcile()` 以 `enabled` 为唯一依据：
+   *
+   *   const key = `${cfg.enabled}|${cfg.listenHost}|${cfg.listenPort}`;
+   *   ...
+   *   } else if (st.state !== 'running') { await relay.start(); }
+   *
+   * 于是有一条必现的「复活链」：
+   *
+   *   1. 点「停用」→ 运行时停了，`enabled` 仍是 true；
+   *   2. 之后任何一次「保存」→ writeConfig 把 lastApplied 置空 →
+   *      reconcile 看到 enabled=true 且 stopped → **立刻重新启动**；
+   *   3. 或重启 dsh → 启动流程同样按 enabled=true 拉起。
+   *
+   * 用户看到的就是「停用关不掉」。现在启停都走 `writeConfig({ enabled })`，
+   * 让 `enabled` 成为唯一事实来源：落盘 + reconcile 一次完成。
+   *
+   * @returns `{ ok, status, error, persisted }`；`persisted=false` 表示内存态
+   *   已生效但写盘失败（重启后可能仍按旧值启动），调用方应当提示用户。
+   */
   async function control(action) {
-    switch (action) {
-      case 'start': {
-        const st = await relay.start();
-        lastApplied = `${readConfig().enabled}|${st.listen.host}|${st.listen.port}`;
-        return { ok: st.state === 'running', status: snapshot(), error: st.lastError };
-      }
-      case 'stop': {
-        await relay.stop();
-        return { ok: true, status: snapshot(), error: null };
-      }
-      case 'toggle': {
-        if (relay.status().state === 'running') {
-          await relay.stop();
-          return { ok: true, status: snapshot(), error: null };
-        }
-        const st = await relay.start();
-        return { ok: st.state === 'running', status: snapshot(), error: st.lastError };
-      }
-      case 'status':
-      default:
-        return { ok: true, status: snapshot(), error: null };
-    }
+    const known = action === 'start' || action === 'stop' || action === 'toggle';
+    if (!known) return { ok: true, status: snapshot(), error: null, persisted: null };
+
+    /** 目标启用状态：start 明确要开，stop 明确要关，toggle 按运行时状态取反。 */
+    const want = action === 'start'
+      ? true
+      : action === 'stop'
+        ? false
+        : relay.status().state !== 'running';
+
+    const saved = await writeConfig({ enabled: want });
+    const status = saved.status ?? snapshot();
+    // 运行时状态才是最终判据：写 enabled 只是让 reconcile 去执行
+    const running = status.state === 'running';
+    return {
+      ok: running === want,
+      status,
+      error: running === want ? null : (status.lastError || null),
+      persisted: saved.persisted,
+    };
   }
 
   /** 写配置：归一化 → 落盘 → 联动中转。 */
@@ -458,8 +480,14 @@ export function apply(ctx, entryConfig) {
    *
    * 之所以要区分「不带」与「空串」：UI 的输入框永远是空的（不回填），
    * 若把「空」当成「清空」，用户每次保存其他设置都会把自己的口令清掉。
+   *
+   * @param options.deferReconcile - 只落盘、**不**触发 reconcile。
+   *   「停用」需要「先写好配置 → 回响应 → 再真正停止」这三步：
+   *   写盘不会掐断连接，停止才会。所以先带着 deferReconcile 落盘，
+   *   就能在响应里给出真实的 `persisted`，再由调用方在响应 flush 之后
+   *   手动 `reconcile` 完成停止（见 /control 路由）。
    */
-  async function writeConfig(patch) {
+  async function writeConfig(patch, options = {}) {
     const source = patch !== null && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
     const merged = { ...toStorable(readConfig()) };
 
@@ -490,6 +518,10 @@ export function apply(ctx, entryConfig) {
     current = candidate;
     const persisted = saveConfig(candidate);
     lastApplied = null;   // 强制 reconcile 走一遍
+    if (options.deferReconcile === true) {
+      // 只落盘：调用方会在响应 flush 之后自己 reconcile（见 /control 的停止分支）
+      return { ok: true, status: snapshot(), error: null, persisted };
+    }
     await reconcile('http config');
     return { ok: true, status: snapshot(), error: null, persisted };
   }
@@ -565,13 +597,34 @@ export function apply(ctx, entryConfig) {
              * （state/uptime/startedAt），其余（listen、config…）保持不变。
              * 下一轮轮询会用真实快照覆盖，预测错了也能自愈。
              */
+            /*
+             * 先落盘、再回响应、最后才真正停止（顺序不能换）：
+             *   写盘不会掐断连接，停止才会；而「先回响应」又拿不到真实的
+             *   persisted。所以拆成三步，两者都能满足。
+             */
+            const saved = await writeConfig({ enabled: false }, { deferReconcile: true });
+            const base = snapshot();
             const predicted = {
-              ...snapshot(), state: 'stopped', uptimeMs: 0, startedAt: null, viaRelay,
+              ...base,
+              state: 'stopped',
+              uptimeMs: 0,
+              startedAt: null,
+              viaRelay,
+              /*
+               * `config.enabled` 也必须预测成 false：
+               * 前端拿到这个响应后会把 draft.enabled 同步过去，若仍是 true，
+               * 复选框会继续勾着 —— 用户随后一保存就又把它拉起来了。
+               */
+              config: { ...(base.config || {}), enabled: false },
             };
-            sendJson(response, 200, { ok: true, status: predicted, error: null });
+            sendJson(response, 200, {
+              ok: true, status: predicted, error: null, persisted: saved.persisted,
+            });
             response.once('finish', () => {
               setImmediate(() => {
-                void control(action).catch((error) => {
+                // 配置已经在上面写过，这里只负责把运行时停掉
+                lastApplied = null;
+                void reconcile('control stop').catch((error) => {
                   log('warn', `停用中转失败：${error?.message || error}`);
                 });
               });
@@ -671,7 +724,7 @@ export function apply(ctx, entryConfig) {
 
       ctx.effect(() => tools.register({
         name: 'relay_control',
-        description: "Start, stop or toggle the dsh-public-relay TCP relay, or read its status. action must be one of 'start', 'stop', 'toggle', 'status'. The relay forwards a local port to this dsh process with Host/Origin rewriting; start/stop take effect immediately without a restart.",
+        description: "Start, stop or toggle the dsh-public-relay TCP relay, or read its status. action must be one of 'start', 'stop', 'toggle', 'status'. Since 0.3.6 start/stop are PERSISTENT: they write the enabled flag to the profile config, so a stopped relay stays stopped across dsh restarts and config saves. The relay forwards a local port to this dsh process with Host/Origin rewriting; start/stop take effect immediately without a restart.",
         parameters: {
           type: 'object',
           properties: {

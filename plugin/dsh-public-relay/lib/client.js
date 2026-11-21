@@ -82,7 +82,7 @@ window.__ModuleLoader__.load({
       off: '已关闭',
       blocked: '已禁用',
       enabled: '启用中转',
-      enabledHint: 'dsh 启动时自动开始中转。关掉后插件仍加载，随时可手动启用。',
+      enabledHint: '持久开关：与上方「停用/启用中转」按钮等价，改的是同一份配置。关掉后中转立即停止，且 dsh 重启也不会自动启动（插件本身仍加载）。',
       listenHost: '中转监听地址',
       listenHostHint: '127.0.0.1 只给本机隧道用（推荐）；0.0.0.0 会让局域网直接可达。',
       listenPort: '中转监听端口',
@@ -113,10 +113,11 @@ window.__ModuleLoader__.load({
       saveRecoverable: '已保存，但写入配置文件失败 —— 本次修改只在当前进程内生效。',
       saveFail: '保存失败',
       needPasswordToSave: '需要先填写访问口令：改配置/启停要求持有口令（它由口令派生，前端不保存口令本身）。填好后点保存即可；已填过则本页内会记住。',
-      viaRelayWarn: '当前页面正通过中转访问（不是一个「旁观的设置页」）：从这里停用中转会立刻断开本页，之后无法在本页重新启用 —— 需要改到 http://127.0.0.1:<dsh端口> 的本机页面里操作，或重新启动 dsh。',
+      viaRelayWarn: '当前页面正通过中转访问（不是一个「旁观的设置页」）：从这里停用会立刻断开本页。停用是持久的 —— dsh 重启后也不会自动恢复，要重新启用请改到 http://127.0.0.1:<dsh端口> 的本机页面里点「启用」。',
       confirmStopViaRelay: '再次点击「停用」确认：这会断开你当前这个页面。想避免断开，请改在本机直连页面上停用。',
       confirmStopRecheck: '已进入确认态：再点一次「停用」才会真正停止中转并断开本页。',
-      stoppedViaRelayNote: '已停用中转。本页仍可用说明它其实是直连 dsh 的。',
+      stoppedViaRelayNote: '已停用中转（已写入配置，重启 dsh 不会自动恢复）。本页仍可用说明它其实是直连 dsh 的。',
+      stopPersistFailed: '已停止中转，但**写入配置文件失败** —— 本次只对当前进程生效，重启 dsh 后可能又按旧配置启动。请检查配置文件是否可写后重新保存。',
       renderCrashWarn: '面板渲染出错（配置未被改动）：',
       renderCrashCtx: '现场信息：',
       renderCrashHint: '把这两行反馈给维护者即可定位。要恢复默认视图：重启 dsh，或改配置文件后重新打开设置页。',
@@ -156,7 +157,7 @@ window.__ModuleLoader__.load({
       off: 'Off',
       blocked: 'Disabled',
       enabled: 'Start relay on boot',
-      enabledHint: 'Starts the relay when dsh boots. Turning it off keeps the plugin loaded.',
+      enabledHint: 'Persistent switch: same setting as the "Disable/Enable relay" button above. Turning it off stops the relay immediately and it will NOT start again on dsh restart (the plugin stays loaded).',
       listenHost: 'Listen address',
       listenHostHint: '127.0.0.1 for tunnel-only access (recommended); 0.0.0.0 exposes it to the LAN.',
       listenPort: 'Listen port',
@@ -188,10 +189,11 @@ window.__ModuleLoader__.load({
       saveFail: 'Save failed',
       portInvalid: 'Enter an integer from 0 to 65535.',
       needPasswordToSave: 'Passcode required: changing settings or starting/stopping needs proof of the passcode (derived from it; the passcode itself is never stored). Type it and save again — it is remembered for this page.',
-      viaRelayWarn: 'This page itself is being served through the relay: disabling the relay here drops this very page, and you cannot re-enable it from the dead page. Stop it from the local http://127.0.0.1:<dsh port> page instead, or restart dsh.',
+      viaRelayWarn: 'This page itself is being served through the relay: disabling it here drops this very page. Disabling is persistent — it will NOT come back after a dsh restart; to re-enable, open the local http://127.0.0.1:<dsh port> page and press "Enable".',
       confirmStopViaRelay: 'Click "Disable" again to confirm: this will disconnect the page you are on. To avoid that, disable it from the local page instead.',
       confirmStopRecheck: 'Confirmation armed: one more click on "Disable" will really stop the relay and drop this page.',
-      stoppedViaRelayNote: 'Relay stopped. This page still works, which means it was talking to dsh directly.',
+      stoppedViaRelayNote: 'Relay stopped (persisted — a dsh restart will not bring it back). This page still works, which means it was talking to dsh directly.',
+      stopPersistFailed: 'Relay stopped, but WRITING THE CONFIG FILE FAILED — this run only, so a dsh restart may start it again from the old config. Check that the config file is writable and save again.',
       renderCrashWarn: 'Panel failed to render (your config was NOT modified): ',
       renderCrashCtx: 'Context: ',
       renderCrashHint: 'Report these two lines to the maintainer. To get the normal view back: restart dsh, or reopen this settings page.',
@@ -586,9 +588,26 @@ window.__ModuleLoader__.load({
         try {
           const res = await sendControl('toggle', draft ? draft.password : '');
           if (!mounted.current) return;
-          if (res && res.status) setSnap(res.status);
+          if (res && res.status) {
+            setSnap(res.status);
+            /*
+             * 0.3.6：启停现在是**持久**的（宿主机把这动作写进了配置的
+             * enabled）。所以必须把结果同步回草稿，只改 enabled 这一个
+             * 字段 —— 整份覆盖会丢掉用户其它还没保存的编辑。
+             *
+             * 不同步的后果就是老 bug 的另一半：界面显示「已停止」，
+             * 但「启用中转」复选框还勾着，用户再点保存就又开起来了。
+             */
+            if (res.status.config) {
+              const nowEnabled = res.status.config.enabled !== false;
+              setDraft((d) => (d === null ? d : { ...d, enabled: nowEnabled }));
+            }
+          }
           if (res && res.ok !== true && res.error) {
             setNote({ kind: 'error', text: errorText(t, res.error) || String(res.error) });
+          } else if (res && res.persisted === false) {
+            // 运行时已生效，但写盘失败：重启 dsh 后可能仍按旧值启动。
+            setNote({ kind: 'error', text: t('stopPersistFailed') });
           } else if (isStop && viaRelay) {
             // 成功停用但页面还活着（极少数情况，例如本页其实是直连）：
             // 说明断开没有发生，给出恢复指引。
@@ -794,8 +813,10 @@ window.__ModuleLoader__.load({
 
         const checkField = (field, label, hint) =>
           h('div', { key: field, className: 'dsr-field' },
-            h('label', { className: 'dsr-check' },
+            h('label', { className: 'dsr-check', htmlFor: `dsr-${mode}-${field}` },
               h('input', {
+                // id + htmlFor：点标签能切换开关（无障碍），也让测试能稳定定位
+                id: `dsr-${mode}-${field}`,
                 type: 'checkbox',
                 checked: draft[field] === true,
                 disabled,

@@ -9,7 +9,7 @@
 | **DSH 插件**（推荐） | 日常使用。跑在 dsh 进程内，设置页里看端口、随时开关 | [`plugin/dsh-public-relay`](plugin/dsh-public-relay) |
 | **独立脚本** | 不想装插件、或要用它的 `dsh web` 守护 | [`dsh-public-relay.js`](dsh-public-relay.js) |
 
-- **当前版本**：`0.3.5`
+- **当前版本**：`0.3.6`
 - **npm**：`dsh-public-relay`
 - **仓库**：<https://github.com/liuNNW/dsh-public-relay>
 - **许可证**：MIT
@@ -312,7 +312,7 @@ plugin/
     locale/{zh,en}.json          插件列表展示元数据
   install.ps1                    自检 / 安装指引 / 旧安装残留清理（须保持 UTF-8 BOM）
   tools/                         诊断、安全审计与开发工具
-  tests/                         七套测试（407 项断言）
+  tests/                         七套测试（422 项断言）
 ```
 
 ---
@@ -322,8 +322,8 @@ plugin/
 ```powershell
 # 七套测试
 node plugin\tests\smoke.mjs              # 中转核心      110 项
-node plugin\tests\host-integration.mjs   # 宿主半         94 项
-node plugin\tests\client-half.mjs        # 浏览器半       81 项
+node plugin\tests\host-integration.mjs   # 宿主半        106 项
+node plugin\tests\client-half.mjs        # 浏览器半       84 项
 node plugin\tests\dsh-session.spec.mjs   # 会话代签       76 项
 node plugin\tests\password-modes.mjs     # 口令模式        6 项
 node plugin\tests\token-exchange.spec.mjs # token 交换验真 25 项
@@ -572,6 +572,7 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 
 | 版本 | 关键变化 |
 | --- | --- |
+| `0.3.6` | **修复**：「停用」关不掉——停了又自己回来。真因是启停只动运行时、**不写配置**，而 `reconcile` 以 `enabled` 为唯一依据：停用后任何一次「保存」或 dsh 重启都会按 `enabled: true` 重新拉起。现在 start/stop/toggle 都会把 `enabled` 落盘；前端停用后同步「启用中转」复选框；`relay_control` 工具同样持久 |
 | `0.3.5` | **修复**：点「停用」后报错、设置页整块失效。真因是 `relay.stop()` 一开头就销毁所有 socket，把承载这次请求的连接（用户正是经中转打开的设置页）连同响应一起掐断。改为优雅排空 + 先回响应再停用；并新增 `viaRelay` 让前端知道「你正在通过中转访问」，停用前二次确认。同时面板不再白屏 —— 渲染异常会显示原因与现场信息 |
 | `0.3.4` | **修复**：设置页「保存/停用」必现 `HTTP 403` —— 管理路由要求 bearer，而前端从未发送。桌面外壳（`dsh-app://app`）改为免凭据，前端补上 bearer 派生（浏览器场景用）。同时修 `hasPassword` 位置错误导致的「口令为空」误报 |
 | `0.3.3` | **观测**：记录每一次「上游 401」的完整上下文（方法/路径/注入的 dsh-auth cookie 结构），`status.upstream401` 可查。同时补齐间歇性 401 的排查工具链与 dsh 接受 cookie 的实测边界 |
@@ -708,6 +709,37 @@ node plugin\tools\probe-admin-403.mjs
 
 修复后的规则：桌面外壳（`dsh-app://app`）免凭据；浏览器里改设置需要在口令框填一次口令
 （前端用它派生 token 并在本页记住）。公网经隧道的请求仍然必须持凭据。
+
+**「停用」点了显示已停止，但过一会儿（或重启 dsh 后）又自己运行起来**
+
+0.3.5 及以前的结构性问题：「停用」**只停运行时，不写配置**。而 `reconcile()`
+以配置里的 `enabled` 为唯一依据：
+
+```js
+const key = `${cfg.enabled}|${cfg.listenHost}|${cfg.listenPort}`;
+...
+} else if (st.state !== 'running') { await relay.start(); }   // enabled=true 且 stopped → 拉起
+```
+
+所以只要 `enabled` 还是 `true`，下面两种情况都会把它复活：
+
+- 停用后再点一次「保存」（`writeConfig` 会把 `lastApplied` 置空 → 强制 reconcile）
+- 重启 dsh（启动流程按 `enabled: true` 自动拉起）
+
+0.3.6 起 `start` / `stop` / `toggle` **都会把 `enabled` 写进配置**，
+`relay_control` 工具也一样；前端停用后会同步「启用中转」复选框，
+不会再出现「已停止但复选框还勾着」导致下次保存又开起来。
+
+判断当前跑的是不是新版本：
+
+```powershell
+# 停用后看配置文件里的 enabled 是否变成 false
+Get-Content "$env:USERPROFILE\.dsh\profiles\desktop\dsh-public-relay.json"
+node plugin\tools\repro-toggle-bug.mjs   # 顺带打印 persisted 字段
+```
+
+`stop` 的响应里 `persisted` 应为 `true`；若是 `false`，说明写盘失败
+（只对当前进程生效，重启后可能又起来），面板会给出提示。
 
 **点了「停用」之后弹一个报错，然后设置页整块变空 / 完全没内容了**
 

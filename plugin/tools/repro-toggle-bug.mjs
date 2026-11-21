@@ -41,6 +41,8 @@ function summarize(label, json) {
   const st = json.status ?? json;
   const keys = Object.keys(st);
   console.log(`  ok=${json.ok}  error=${JSON.stringify(json.error ?? null)}`);
+  // 0.3.6：停用会写配置，persisted=false 表示写盘失败（重启后可能又起来）
+  if (json.persisted !== undefined) console.log(`  persisted=${json.persisted}`);
   console.log(`  顶层字段(${keys.length}): ${keys.join(', ')}`);
   console.log(`  state=${st.state}  lastError=${JSON.stringify(st.lastError ?? null)}`);
   console.log(`  listen=${JSON.stringify(st.listen ?? null)}`);

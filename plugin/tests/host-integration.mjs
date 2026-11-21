@@ -627,6 +627,72 @@ async function main() {
       `port ${relayPort} still listening`);
   }
 
+  // ═══ 0.3.6 回归锁：启停必须持久，停用不能自己复活 ═══
+  //
+  // 这是「插件停用后关不掉」的真因：旧实现只调 relay.stop()，`enabled` 留在
+  // true。而 reconcile 以 enabled 为唯一依据 —— 于是「停用后再保存任意设置」
+  // 或「重启 dsh」都会把它按 enabled=true 立刻拉回来。
+  section('启停是持久的（停用不能自己复活）');
+  {
+    const PW = 'integration-pass';
+    const sameOrigin = { origin: `http://127.0.0.1:${dshPort}` };
+
+    // 起点：确保运行
+    await callRoute(host, 'POST', '/dsh-public-relay/control', {
+      headers: sameOrigin, body: { action: 'start' }, adminAs: PW,
+    });
+    check('起点：中转运行中', await portListening(relayPort) === true, 'relay not listening');
+
+    // 停用 → 必须落盘 enabled=false
+    const stopRes = await callRoute(host, 'POST', '/dsh-public-relay/control', {
+      headers: sameOrigin, body: { action: 'stop' }, adminAs: PW,
+    });
+    const stopJson = JSON.parse(stopRes.body);
+    check('stop 返回 persisted=true（确实写了盘）', stopJson.persisted === true,
+      JSON.stringify(stopJson).slice(0, 220));
+    check('stop 后运行时为 stopped', stopJson.status.state === 'stopped',
+      `got ${stopJson.status.state}`);
+    check('stop 后配置文件 enabled=false', h.readConfigFile()?.enabled === false,
+      JSON.stringify(h.readConfigFile()).slice(0, 220));
+    check('stop 后端口已释放',
+      await waitUntil(async () => (await portListening(relayPort)) === false),
+      `port ${relayPort} still listening`);
+
+    // ★ 核心：停用后再保存「其它」字段，绝不能被 enabled 拉回来
+    const saveOther = await callRoute(host, 'POST', '/dsh-public-relay/config', {
+      headers: sameOrigin,
+      body: { config: { forceLoopback: true } },
+      adminAs: PW,
+    });
+    check('停用后保存其它字段 → 200', saveOther.status === 200, `got ${saveOther.status}`);
+    check('★ 停用后保存其它字段 → 仍为 stopped（不会自己复活）',
+      JSON.parse(saveOther.body).status.state === 'stopped', saveOther.body.slice(0, 220));
+    check('★ 停用后保存其它字段 → 端口仍未被占用',
+      await waitUntil(async () => (await portListening(relayPort)) === false),
+      `port ${relayPort} came back`);
+
+    // 启用 → 落盘 true，且真的在跑
+    const startRes = await callRoute(host, 'POST', '/dsh-public-relay/control', {
+      headers: sameOrigin, body: { action: 'start' }, adminAs: PW,
+    });
+    check('start 后运行时为 running', JSON.parse(startRes.body).status.state === 'running',
+      startRes.body.slice(0, 220));
+    check('start 后配置文件 enabled=true', h.readConfigFile()?.enabled === true,
+      JSON.stringify(h.readConfigFile()).slice(0, 220));
+
+    // toggle 往返两次后，配置与运行时状态一致
+    await callRoute(host, 'POST', '/dsh-public-relay/control', {
+      headers: sameOrigin, body: { action: 'toggle' }, adminAs: PW,
+    });
+    check('toggle 一次 → 配置 enabled=false', h.readConfigFile()?.enabled === false,
+      JSON.stringify(h.readConfigFile()).slice(0, 220));
+    await callRoute(host, 'POST', '/dsh-public-relay/control', {
+      headers: sameOrigin, body: { action: 'toggle' }, adminAs: PW,
+    });
+    check('toggle 两次 → 配置 enabled=true', h.readConfigFile()?.enabled === true,
+      JSON.stringify(h.readConfigFile()).slice(0, 220));
+  }
+
   section('配置写入（自有 JSON 文件，不依赖 settings 服务）');
   {
     const saved = await callRoute(host, 'POST', '/dsh-public-relay/config', {

@@ -609,6 +609,20 @@ async function main() {
       return found;
     }
 
+    /** 按 id 找输入控件（用于读复选框的 checked）。 */
+    function findById(root, id) {
+      let found = null;
+      const walk = (n) => {
+        if (n === null || n === undefined || typeof n !== 'object') return;
+        if (Array.isArray(n)) { for (const c of n) walk(c); return; }
+        if (!n.__el) return;
+        if (n.props && n.props.id === id) found = n;
+        for (const c of n.children) walk(c);
+      };
+      walk(root);
+      return found;
+    }
+
     env.setFetchResponder(async () => ({ ok: true, status: 200, json: async () => fullStatus }));
     let rr = fake.render(settingsReg.component(slotProps));
     fake.runEffects(rr.effects);
@@ -618,13 +632,28 @@ async function main() {
     const toggleBtn = findButton(rr.out, '停用中转');
     check('找到「停用中转」按钮', toggleBtn !== null, textOf(rr.out).join(' | ').slice(0, 300));
 
-    // /control 返回停止态快照（与真实宿主一致）
+    // 停用前：「启用中转」复选框必须是勾上的（对照组）
+    const beforeEnabled = findById(rr.out, 'dsr-section-enabled');
+    check('停用前「启用中转」复选框为勾选',
+      beforeEnabled !== null && beforeEnabled.props.checked === true,
+      JSON.stringify(beforeEnabled && beforeEnabled.props.checked));
+
+    /*
+     * /control 返回停止态快照 —— 关键是 config.enabled 也必须是 false。
+     *
+     * 0.3.6 起宿主机把「停用」持久化进配置；前端必须把这个结果同步回草稿，
+     * 否则复选框继续勾着，用户随手一保存又把它开起来（老 bug 的另一半）。
+     */
     const stoppedSnap = {
-      ...fullStatus, state: 'stopped', uptimeMs: 0, startedAt: null,
+      ...fullStatus,
+      state: 'stopped',
+      uptimeMs: 0,
+      startedAt: null,
+      config: { ...fullStatus.config, enabled: false },
     };
     env.setFetchResponder(async (url) => {
       if (String(url).includes('/dsh-public-relay/control')) {
-        return { ok: true, status: 200, json: async () => ({ ok: true, status: stoppedSnap, error: null }) };
+        return { ok: true, status: 200, json: async () => ({ ok: true, status: stoppedSnap, error: null, persisted: true }) };
       }
       return { ok: true, status: 200, json: async () => fullStatus };
     });
@@ -647,6 +676,14 @@ async function main() {
     check('停用后请求确实发到了 /control',
       env.fetchCalls.some((c) => String(c.url).endsWith('/dsh-public-relay/control')),
       JSON.stringify(env.fetchCalls.map((c) => c.url)));
+
+    // ★ 0.3.6 核心：停用后「启用中转」复选框必须跟着取消勾选
+    const afterEnabled = after ? findById(after.out, 'dsr-section-enabled') : null;
+    check('★ 停用后「启用中转」复选框变为未勾选',
+      afterEnabled !== null && afterEnabled.props.checked === false,
+      JSON.stringify(afterEnabled && afterEnabled.props.checked));
+    check('★ 停用后不误报「有未保存的修改」',
+      !afterText.includes('有未保存的修改'), afterText.slice(-400));
 
     env.setFetchResponder(async () => ({ ok: true, status: 200, json: async () => fullStatus }));
   }
