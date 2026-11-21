@@ -465,6 +465,8 @@ async function main() {
   section('渲染：宿主可用');
   const fullStatus = {
     ok: true,
+    // 快照结构版本号（与 lib/index.js 的 SNAPSHOT_PROTOCOL 一致）
+    protocol: 1,
     state: 'running',
     listen: { host: '127.0.0.1', port: 3091, address: '127.0.0.1:3091' },
     target: { host: '127.0.0.1', port: 3080, origin: 'http://127.0.0.1:3080' },
@@ -902,6 +904,101 @@ async function main() {
     check('出错时带出异常原文', crashText.includes('render-boom'), crashText.slice(0, 400));
     check('出错时带出 state / viaRelay 现场信息',
       crashText.includes('state=') && crashText.includes('viaRelay='), crashText.slice(0, 500));
+
+    env.setFetchResponder(async () => ({ ok: true, status: 200, json: async () => fullStatus }));
+  }
+
+  // ── 畸形快照不再崩溃（0.3.7 回归）──
+  //
+  // 用户实际报的崩溃：`Cannot read properties of undefined (reading 'address')`
+  // —— 面板假设 snap 一定是状态快照，缺 fields 就把整块渲染干掉。
+  // 现在入库前有 isSnapshot 校验，脏数据不覆盖旧快照；渲染层再兜一层。
+  section('畸形状态快照不崩溃、不覆盖旧快照');
+  {
+    /** 在元素树里找按钮 / 按 id 找控件（本小节独立定义，不复用别处作用域）。 */
+    const findButton = (root, needle) => {
+      let found = null;
+      const walk = (n) => {
+        if (n === null || n === undefined || typeof n !== 'object') return;
+        if (Array.isArray(n)) { for (const c of n) walk(c); return; }
+        if (!n.__el) return;
+        if (n.type === 'button' && typeof n.props?.onClick === 'function'
+          && textOf(n).join('').includes(needle)) found = n;
+        for (const c of n.children) walk(c);
+      };
+      walk(root);
+      return found;
+    };
+
+    // 起点：拿到一份正常的运行中快照
+    env.setFetchResponder(async () => ({ ok: true, status: 200, json: async () => fullStatus }));
+    let base = fake.render(settingsReg.component(slotProps));
+    fake.runEffects(base.effects);
+    await new Promise((r) => setTimeout(r, 30));
+    base = fake.render(settingsReg.component(slotProps));
+    check('起点：面板显示运行中与监听地址',
+      textOf(base.out).join(' | ').includes('运行中'),
+      textOf(base.out).join(' | ').slice(0, 300));
+
+    /**
+     * 让 /control 回一个畸形的 status，然后点一次启停按钮。
+     * 这条路径会调用 applyStatus，正是需要验证的入口。
+     */
+    const clickWithStatus = async (controlStatus) => {
+      env.setFetchResponder(async (url) => {
+        if (String(url).includes('/dsh-public-relay/control')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ ok: true, status: controlStatus, error: null, persisted: true }),
+          };
+        }
+        return { ok: true, status: 200, json: async () => fullStatus };
+      });
+      let rr = fake.render(settingsReg.component(slotProps));
+      const btn = findButton(rr.out, '停用中转') || findButton(rr.out, '启用中转');
+      let clickErr = null;
+      if (btn !== null) {
+        try { await btn.props.onClick(); } catch (err) { clickErr = err; }
+      }
+      await new Promise((r) => setTimeout(r, 40));
+      let out = null;
+      let renderErr = null;
+      try { out = fake.render(settingsReg.component(slotProps)); } catch (err) { renderErr = err; }
+      return { clickErr, renderErr, text: out ? textOf(out.out).join(' | ') : '' };
+    };
+
+    const cases = [
+      { label: '只有 {ok:true}', status: { ok: true } },
+      { label: '缺 listen', status: { state: 'stopped' } },
+      { label: '缺 state', status: { listen: { host: '127.0.0.1', port: 3091, address: '127.0.0.1:3091' } } },
+      { label: 'listen 为 null', status: { state: 'stopped', listen: null } },
+    ];
+
+    for (const c of cases) {
+      const r = await clickWithStatus(c.status);
+      check(`畸形快照（${c.label}）不抛异常`,
+        r.clickErr === null && r.renderErr === null,
+        `${c.clickErr && c.clickErr.message} / ${r.renderErr && r.renderErr.message}`);
+      check(`畸形快照（${c.label}）不出现「渲染出错」`,
+        !r.text.includes('渲染出错'), r.text.slice(0, 300));
+      check(`畸形快照（${c.label}）给出「缺少必需字段」提示`,
+        r.text.includes('缺少必需字段'), r.text.slice(0, 300));
+      check(`畸形快照（${c.label}）保留上一次的可用状态`,
+        r.text.includes('运行中'), r.text.slice(0, 300));
+    }
+
+    // 版本不一致：结构够用但要提示重启/硬刷新
+    const mismatch = await clickWithStatus({ ...fullStatus, protocol: 99, state: 'stopped' });
+    check('协议版本不一致时提示重启 / 硬刷新',
+      mismatch.text.includes('版本不一致'), mismatch.text.slice(0, 400));
+
+    // 恢复：协议正确时不应再有告警
+    const good = await clickWithStatus({ ...fullStatus, protocol: 1, state: 'stopped' });
+    check('协议版本一致时不再提示版本不一致',
+      !good.text.includes('版本不一致'), good.text.slice(0, 400));
+    check('合法快照正常生效（显示已停止）',
+      good.text.includes('已停止'), good.text.slice(0, 400));
 
     env.setFetchResponder(async () => ({ ok: true, status: 200, json: async () => fullStatus }));
   }

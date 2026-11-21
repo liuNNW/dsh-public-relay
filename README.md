@@ -9,7 +9,7 @@
 | **DSH 插件**（推荐） | 日常使用。跑在 dsh 进程内，设置页里看端口、随时开关 | [`plugin/dsh-public-relay`](plugin/dsh-public-relay) |
 | **独立脚本** | 不想装插件、或要用它的 `dsh web` 守护 | [`dsh-public-relay.js`](dsh-public-relay.js) |
 
-- **当前版本**：`0.3.6`
+- **当前版本**：`0.3.7`
 - **npm**：`dsh-public-relay`
 - **仓库**：<https://github.com/liuNNW/dsh-public-relay>
 - **许可证**：MIT
@@ -312,7 +312,7 @@ plugin/
     locale/{zh,en}.json          插件列表展示元数据
   install.ps1                    自检 / 安装指引 / 旧安装残留清理（须保持 UTF-8 BOM）
   tools/                         诊断、安全审计与开发工具
-  tests/                         七套测试（422 项断言）
+  tests/                         七套测试（447 项断言）
 ```
 
 ---
@@ -322,8 +322,8 @@ plugin/
 ```powershell
 # 七套测试
 node plugin\tests\smoke.mjs              # 中转核心      110 项
-node plugin\tests\host-integration.mjs   # 宿主半        106 项
-node plugin\tests\client-half.mjs        # 浏览器半       84 项
+node plugin\tests\host-integration.mjs   # 宿主半        111 项
+node plugin\tests\client-half.mjs        # 浏览器半      104 项
 node plugin\tests\dsh-session.spec.mjs   # 会话代签       76 项
 node plugin\tests\password-modes.mjs     # 口令模式        6 项
 node plugin\tests\token-exchange.spec.mjs # token 交换验真 25 项
@@ -572,6 +572,7 @@ powershell -ExecutionPolicy Bypass -File plugin\install.ps1 -Revert
 
 | 版本 | 关键变化 |
 | --- | --- |
+| `0.3.7` | **修复**：面板报「渲染出错：Cannot read properties of undefined (reading 'address')」。原因是渲染直接读 `snap.listen.address`，而拿到的对象**不是状态快照**（缺 `state`/`listen`）时整块面板被干掉。现在入库前用 `isSnapshot` 校验形状，脏数据**不覆盖**旧快照；渲染层再兜一层可选访问；`/status` 新增 `protocol` 版本号，面板与插件不同代时提示「重启 dsh / 硬刷新」；兜底信息补 `proto=` 与 `keys=`，下次可一眼定位 |
 | `0.3.6` | **修复**：「停用」关不掉——停了又自己回来。真因是启停只动运行时、**不写配置**，而 `reconcile` 以 `enabled` 为唯一依据：停用后任何一次「保存」或 dsh 重启都会按 `enabled: true` 重新拉起。现在 start/stop/toggle 都会把 `enabled` 落盘；前端停用后同步「启用中转」复选框；`relay_control` 工具同样持久 |
 | `0.3.5` | **修复**：点「停用」后报错、设置页整块失效。真因是 `relay.stop()` 一开头就销毁所有 socket，把承载这次请求的连接（用户正是经中转打开的设置页）连同响应一起掐断。改为优雅排空 + 先回响应再停用；并新增 `viaRelay` 让前端知道「你正在通过中转访问」，停用前二次确认。同时面板不再白屏 —— 渲染异常会显示原因与现场信息 |
 | `0.3.4` | **修复**：设置页「保存/停用」必现 `HTTP 403` —— 管理路由要求 bearer，而前端从未发送。桌面外壳（`dsh-app://app`）改为免凭据，前端补上 bearer 派生（浏览器场景用）。同时修 `hasPassword` 位置错误导致的「口令为空」误报 |
@@ -709,6 +710,29 @@ node plugin\tools\probe-admin-403.mjs
 
 修复后的规则：桌面外壳（`dsh-app://app`）免凭据；浏览器里改设置需要在口令框填一次口令
 （前端用它派生 token 并在本页记住）。公网经隧道的请求仍然必须持凭据。
+
+**面板显示「渲染出错：Cannot read properties of undefined (reading 'address')」**
+
+0.3.7 及以前：渲染直接读 `snap.listen.address`，只要拿到的对象**不是状态快照**
+（缺 `state` / `listen`），整个面板就被这一个字段带崩。
+兜底文案里那句「配置未被改动」是真的 —— 崩的是渲染，不是你的配置。
+
+常见诱因是**客户端与宿主不是同一代**：桌面外壳可能缓存着旧的 client bundle，
+或宿主仍是旧版，两边字段形状对不上。
+
+0.3.7 起：
+
+- 入库前用 `isSnapshot` 校验（要有 `state` 字符串 + `listen` 对象），
+  脏数据**不覆盖**已有快照，只提示「宿主返回的状态缺少必需字段（keys=…）」
+- 渲染层对 `listen` / `state` 全部改成可选访问，缺字段显示 `—`，不再抛错
+- `/status` 新增 `protocol`（当前 `1`），跨代时提示「请完全退出 dsh 再启动；浏览器再硬刷新」
+
+如果还想定位得更细，看兜底里这两项：
+
+| 字段 | 含义 |
+| --- | --- |
+| `proto=` | 缺失 → 宿主是旧版或响应不是快照；`proto=1` 却仍崩 → 另有一处字段问题，请把 `keys=` 一起反馈 |
+| `keys=` | 收到的对象到底有哪些键。没有 `state`/`listen` 就说明它不是快照 |
 
 **「停用」点了显示已停止，但过一会儿（或重启 dsh 后）又自己运行起来**
 

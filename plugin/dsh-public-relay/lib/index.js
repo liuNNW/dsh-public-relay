@@ -46,6 +46,17 @@ export const inject = ['webServer'];
 /** 路由前缀。与 client.js 里的 API_PREFIX 必须一致。 */
 const ROUTE_PREFIX = '/dsh-public-relay';
 
+/**
+ * 状态快照的结构版本号（与 client.js 的 SNAPSHOT_PROTOCOL 必须一致）。
+ *
+ * 加它的原因：桌面外壳/浏览器可能仍在跑上一代的 client bundle，而宿主已经是
+ * 新版 —— 字段形状对不上时，旧客户端会因缺字段把整块面板渲染崩掉
+ * （典型报错「Cannot read properties of undefined (reading 'address')」）。
+ * 有了版本号，客户端能明确说「版本不一致，请重启 dsh / 硬刷新」，
+ * 而不是白屏或抛一句无上下文的 TypeError。
+ */
+const SNAPSHOT_PROTOCOL = 1;
+
 /** 请求体上限。 */
 const MAX_BODY_BYTES = 32 * 1024;
 
@@ -399,6 +410,18 @@ export function apply(ctx, entryConfig) {
      */
     const hasPassword = Boolean(config.password);
     return {
+      /*
+       * 快照结构版本号。
+       *
+       * 客户端据此判断「面板与插件是不是同一代」：桌面外壳可能还在跑旧的
+       * client bundle，或反过来宿主是旧的。此时字段形状可能对不上，
+       * 旧客户端会在渲染时因为缺字段崩掉整块面板（0.3.7 修的正是这个）。
+       * 有这个字段，客户端就能明确提示「请重启 dsh / 硬刷新」，
+       * 而不是白屏或者显示成「渲染出错：Cannot read properties of undefined」。
+       *
+       * 改动快照字段时**必须**同步递增，并同步 client.js 的 SNAPSHOT_PROTOCOL。
+       */
+      protocol: SNAPSHOT_PROTOCOL,
       ...status,
       dshPort: dsh.port,
       dshAddress: status.dsh?.address ?? null,

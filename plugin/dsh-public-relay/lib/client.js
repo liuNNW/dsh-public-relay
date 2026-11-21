@@ -44,6 +44,32 @@ window.__ModuleLoader__.load({
     /** 与 lib/index.js 的 ROUTE_PREFIX 必须一致。 */
     const API_PREFIX = 'dsh-public-relay';
 
+    /**
+     * 状态快照的结构版本号（与 lib/index.js 的 SNAPSHOT_PROTOCOL 必须一致）。
+     *
+     * 宿主改了快照字段就要递增；客户端不匹配时不会硬渲染，而是提示版本不一致。
+     */
+    const SNAPSHOT_PROTOCOL = 1;
+
+    /**
+     * 收到的响应到底是不是一份可用的状态快照。
+     *
+     * 为什么需要校验：面板此前**假设**拿到的对象一定带 `state` / `listen`，
+     * 一旦宿主回了别的形状（旧版本宿主、被代理/拦截的响应、异常兜底的 JSON），
+     * 渲染就会抛 `Cannot read properties of undefined (reading 'address')`
+     * 并把整块面板干掉（0.3.7 修的就是这个）。
+     *
+     * 判据取「结构必需字段」而不是严格全等：新增字段不该让旧客户端拒绝数据。
+     */
+    function isSnapshot(value) {
+      return value !== null
+        && typeof value === 'object'
+        && !Array.isArray(value)
+        && typeof value.state === 'string'
+        && value.listen !== null
+        && typeof value.listen === 'object';
+    }
+
     /** locale 命名空间（同时也是 ctx.locale.register 的 key）。 */
     const LOCALE_NS = 'dsh-public-relay';
 
@@ -121,6 +147,9 @@ window.__ModuleLoader__.load({
       renderCrashWarn: '面板渲染出错（配置未被改动）：',
       renderCrashCtx: '现场信息：',
       renderCrashHint: '把这两行反馈给维护者即可定位。要恢复默认视图：重启 dsh，或改配置文件后重新打开设置页。',
+      snapshotInvalid: '宿主返回的状态缺少必需字段，本次数据已忽略（面板保留上一次可用状态）。',
+      snapshotVersionMismatch: '面板与插件版本不一致，部分信息可能显示不准。请完全退出 dsh 再启动；浏览器访问时再硬刷新一次（Ctrl+F5）。',
+      stateUnknown: '未知',
       portInvalid: '请填 0–65535 的整数。',
       dirty: '有未保存的修改',
       configFile: '配置文件',
@@ -197,6 +226,9 @@ window.__ModuleLoader__.load({
       renderCrashWarn: 'Panel failed to render (your config was NOT modified): ',
       renderCrashCtx: 'Context: ',
       renderCrashHint: 'Report these two lines to the maintainer. To get the normal view back: restart dsh, or reopen this settings page.',
+      snapshotInvalid: 'The host returned a status payload missing required fields; this update was ignored (the panel keeps the last usable state).',
+      snapshotVersionMismatch: 'Panel and plugin versions do not match, so some values may be wrong. Fully quit and restart dsh; for browser access also hard-refresh (Ctrl+F5).',
+      stateUnknown: 'Unknown',
       dirty: 'Unsaved changes',
       configFile: 'Config file',
       patched: 'Patched bundles',
@@ -479,6 +511,30 @@ window.__ModuleLoader__.load({
       const mounted = useRef(true);
 
       /**
+       * 收下一份状态快照。形状不对就**不覆盖**旧数据。
+       *
+       * 两条防线：
+       *   1. `isSnapshot` 不通过 → 完全忽略本次数据，保留上一次可用状态，
+       *      只提示「宿主返回的状态缺少字段（keys=…）」。脏数据永远进不了 state。
+       *   2. 结构够用但 `protocol` 缺失/不符 → 仍然使用（结构字段齐全），
+       *      但提示版本不一致（桌面外壳常缓存旧 bundle），引导重启/硬刷新。
+       */
+      const applyStatus = (payload) => {
+        if (!isSnapshot(payload)) {
+          const keys = payload !== null && typeof payload === 'object'
+            ? Object.keys(payload).join(',')
+            : String(payload);
+          setNote({ kind: 'error', text: `${t('snapshotInvalid')}（keys=${keys}）` });
+          return false;
+        }
+        if (payload.protocol !== SNAPSHOT_PROTOCOL) {
+          setNote({ kind: 'error', text: t('snapshotVersionMismatch') });
+        }
+        setSnap(payload);
+        return true;
+      };
+
+      /**
        * 当前页面是不是**经中转**加载的（而不是直连 dsh 端口）。
        *
        * 判据以宿主半回的 `viaRelay` 为准：中转给每个转发请求打了标记头，
@@ -536,7 +592,8 @@ window.__ModuleLoader__.load({
           const res = await readStatus().catch(() => null);
           if (!alive || !mounted.current) return;
           if (res && res.ok === true) {
-            setSnap(res);
+            // 形状不对就不覆盖旧快照（见 applyStatus 的说明）
+            applyStatus(res);
             // 只在还没编辑时同步草稿，避免覆盖用户正在输入的内容
             setDraft((prev) => (prev === null && res.config ? draftFrom(res.config) : prev));
           } else if (res && res.error) {
@@ -589,7 +646,7 @@ window.__ModuleLoader__.load({
           const res = await sendControl('toggle', draft ? draft.password : '');
           if (!mounted.current) return;
           if (res && res.status) {
-            setSnap(res.status);
+            applyStatus(res.status);
             /*
              * 0.3.6：启停现在是**持久**的（宿主机把这动作写进了配置的
              * enabled）。所以必须把结果同步回草稿，只改 enabled 这一个
@@ -639,7 +696,7 @@ window.__ModuleLoader__.load({
           if (!mounted.current) return;
           if (res && res.ok === true) {
             if (res.status) {
-              setSnap(res.status);
+              applyStatus(res.status);
               if (res.status.config) setDraft(draftFrom(res.status.config));
             }
             setNote(res.persisted === false
@@ -687,12 +744,22 @@ window.__ModuleLoader__.load({
       if (snap === null) {
         body.push(h('p', { key: 'loading', className: 'dsr-text' }, t('loading')));
       } else {
-        const running = snap.state === 'running';
-        const meta = snap.state === 'running'
+        /*
+         * 归一化一次，后面只认 `state`。
+         * 快照理论上必有 `state`（applyStatus 已校验），但渲染层不能依赖上层的
+         * 契约 —— 这里再兜一层，任何缺失都落到 unknown，绝不再抛。
+         */
+        const state = typeof snap.state === 'string' ? snap.state : 'unknown';
+        const listen = snap.listen !== null && typeof snap.listen === 'object' ? snap.listen : null;
+        const running = state === 'running';
+        const meta = state === 'running'
           ? { label: t('running'), color: '#22c55e' }
-          : snap.state === 'error'
+          : state === 'error'
             ? { label: snap.lastError === 'port-in-use' ? t('portInUse') : t('error'), color: '#ef4444' }
-            : { label: t('stopped'), color: '#9ca3af' };
+            : state === 'unknown'
+              // 快照缺 state：不猜「已停止」（那会误导），直接标未知
+              ? { label: t('stateUnknown'), color: '#f59e0b' }
+              : { label: t('stopped'), color: '#9ca3af' };
 
         body.push(h('div', { key: 'ports', className: 'dsr-box' },
           h('div', { className: 'dsr-row' },
@@ -705,11 +772,12 @@ window.__ModuleLoader__.load({
             }, t('copy'))),
           h('div', { className: 'dsr-row' },
             h('span', { className: 'dsr-key' }, t('relayListen')),
-            h('span', { className: 'dsr-val dsr-valSm' }, snap.listen.address),
+            h('span', { className: 'dsr-val dsr-valSm' }, listen ? listen.address : '—'),
             h('button', {
               type: 'button',
               className: 'dsr-btn dsr-btnSm',
-              onClick: () => onCopy(String(snap.listen.port)),
+              disabled: listen === null,
+              onClick: () => onCopy(listen ? String(listen.port) : ''),
             }, t('copy'))),
           h('div', { className: 'dsr-row' },
             h('span', { className: 'dsr-key' }, t('upstream')),
@@ -900,11 +968,21 @@ window.__ModuleLoader__.load({
 
       } catch (renderError) {
         const detail = String((renderError && renderError.message) || renderError);
-        const state = snap && snap.state ? String(snap.state) : 'null';
+        const stateText = snap && typeof snap.state === 'string' ? snap.state : 'null';
+        /*
+         * 现场信息要能**直接定位**，所以把快照的键列表和协议版本也带出来：
+         *   · keys 里没有 state/listen  → 收到的不是快照（被代理/旧宿主/脏数据）
+         *   · proto 缺失或不等于 1      → 面板与插件版本不一致（重启 dsh / 硬刷新）
+         * 只有这两项在，下一次同类反馈才不用再猜。
+         */
+        const snapKeys = snap !== null && typeof snap === 'object' && !Array.isArray(snap)
+          ? Object.keys(snap).join(',')
+          : String(snap);
+        const proto = snap !== null && typeof snap === 'object' ? (snap.protocol ?? '缺失') : '—';
         body.push(h('div', { key: 'renderCrash', className: 'dsr-warn' },
           `⚠ ${t('renderCrashWarn')}${detail}`));
         body.push(h('p', { key: 'renderCrashCtx', className: 'dsr-text' },
-          `${t('renderCrashCtx')}state=${state}｜viaRelay=${viaRelay ? '1' : '0'}｜snap=${snap === null ? 'null' : 'object'}`));
+          `${t('renderCrashCtx')}state=${stateText}｜viaRelay=${viaRelay ? '1' : '0'}｜snap=${snap === null ? 'null' : 'object'}｜proto=${proto}｜keys=${snapKeys}`));
         body.push(h('p', { key: 'renderCrashHint', className: 'dsr-text' }, t('renderCrashHint')));
       }
 

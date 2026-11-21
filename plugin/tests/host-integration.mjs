@@ -693,6 +693,27 @@ async function main() {
       JSON.stringify(h.readConfigFile()).slice(0, 220));
   }
 
+  // ═══ /status 的快照契约 ═══
+  //
+  // 客户端面板按这些字段渲染。少一个字段旧客户端就会崩
+  // （`Cannot read properties of undefined (reading 'address')`），
+  // 所以把它当契约锁住；`protocol` 让面板能判断「我是不是同一代」。
+  section('/status 快照契约');
+  {
+    const res = await callRoute(host, 'GET', '/dsh-public-relay/status');
+    check('/status → 200', res.status === 200, `got ${res.status}`);
+    const snap = JSON.parse(res.body);
+    check('含 state（字符串）', typeof snap.state === 'string', `got ${typeof snap.state}`);
+    check('含 listen.address（字符串）',
+      snap.listen !== null && typeof snap.listen === 'object'
+        && typeof snap.listen.address === 'string',
+      JSON.stringify(snap.listen));
+    check('含 listen.port（数字）',
+      snap.listen !== null && typeof snap.listen.port === 'number',
+      JSON.stringify(snap.listen && snap.listen.port));
+    check('含 protocol=1（面板版本一致性判据）', snap.protocol === 1, `got ${snap.protocol}`);
+  }
+
   section('配置写入（自有 JSON 文件，不依赖 settings 服务）');
   {
     const saved = await callRoute(host, 'POST', '/dsh-public-relay/config', {
